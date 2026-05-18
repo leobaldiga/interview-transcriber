@@ -1,0 +1,81 @@
+# =========================
+# PYTHON
+# =========================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+.venv-pyannote/
+venv/
+env/
+ENV/
+pyvenv.cfg
+
+# Local Python / dependency folders (only if these exist from local envs)
+bin/
+include/
+lib/
+lib64/
+share/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Pytest / coverage / tooling caches
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+htmlcov/
+coverage.xml
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# =========================
+# LOCAL ENV / SECRETS
+# =========================
+
+.env
+.env.*
+.hf_token
+.python-version
+
+# =========================
+# APP DATA
+# =========================
+
+outputs/
+uploads/
+
+# =========================
+# LOGS / LOCAL DB
+# =========================
+
+*.log
+*.sqlite
+*.sqlite3
+
+# =========================
+# EDITORS / OS
+# =========================
+
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Transcript Editor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/css/editor.css">
+</head>
+<body>
+
+<!-- ── Top bar ───────────────────────────────────────────────── -->
+<header class="ed-header">
+  <a href="/" class="ed-back" title="Back to jobs">&#8592; Jobs</a>
+  <span class="ed-title" id="edTitle">Loading&hellip;</span>
+  <div class="ed-header-actions">
+    <button class="ed-btn ed-btn--ghost" id="btnFindReplace" title="Find &amp; Replace (Ctrl+H)">
+      &#128269; Find &amp; Replace
+    </button>
+    <button class="ed-btn ed-btn--primary" id="btnSave">Save Transcript</button>
+  </div>
+</header>
+
+<!-- ── Find & Replace bar (hidden by default) ───────────────── -->
+<div class="ed-find-bar" id="findBar" hidden>
+  <input class="ed-find-input" id="findInput" placeholder="Find&hellip;" autocomplete="off">
+  <input class="ed-find-input" id="replaceInput" placeholder="Replace with&hellip;" autocomplete="off">
+  <button class="ed-btn ed-btn--sm" id="btnFindPrev">&#9650;</button>
+  <button class="ed-btn ed-btn--sm" id="btnFindNext">&#9660;</button>
+  <button class="ed-btn ed-btn--sm" id="btnReplaceOne">Replace</button>
+  <button class="ed-btn ed-btn--sm" id="btnReplaceAll">Replace All</button>
+  <span class="ed-find-count" id="findCount"></span>
+  <button class="ed-btn ed-btn--ghost ed-btn--sm" id="btnCloseFindBar">&times;</button>
+</div>
+
+<!-- ── Audio player ──────────────────────────────────────────── -->
+<div class="ed-player" id="edPlayer">
+  <button class="ed-play-btn" id="btnPlayPause" title="Play/Pause (Space)">&#9654;</button>
+  <span class="ed-time" id="currentTime">0:00</span>
+  <div class="ed-scrubber-wrap">
+    <input type="range" class="ed-scrubber" id="scrubber" min="0" max="100" step="0.01" value="0">
+    <div class="ed-waveform-bg"></div>
+  </div>
+  <span class="ed-time" id="totalTime">0:00</span>
+  <label class="ed-speed-label">Speed
+    <select class="ed-speed-select" id="speedSelect">
+      <option value="0.5">0.5×</option>
+      <option value="0.75">0.75×</option>
+      <option value="1" selected>1×</option>
+      <option value="1.25">1.25×</option>
+      <option value="1.5">1.5×</option>
+      <option value="1.75">1.75×</option>
+      <option value="2">2×</option>
+    </select>
+  </label>
+</div>
+
+<audio id="audioEl" preload="auto"></audio>
+
+<!-- ── Main content ──────────────────────────────────────────── -->
+<div class="ed-main">
+
+  <!-- Transcript pane -->
+  <div class="ed-transcript-pane" id="transcriptPane">
+    <div class="ed-pane-header">
+      <span>Transcript</span>
+      <div class="ed-legend">
+        <span class="ed-conf ed-conf--high">high</span>
+        <span class="ed-conf ed-conf--mid">mid</span>
+        <span class="ed-conf ed-conf--low">low</span>
+        confidence
+      </div>
+    </div>
+    <div class="ed-segments" id="edSegments">
+      <div class="ed-loading">Loading transcript&hellip;</div>
+    </div>
+  </div>
+
+  <!-- Dictionary pane -->
+  <div class="ed-dict-pane" id="dictPane">
+    <div class="ed-pane-header">
+      <span>Custom Dictionary</span>
+      <div class="ed-dict-scope-tabs">
+        <button class="ed-scope-tab ed-scope-tab--active" data-scope="group" id="tabGroup">Group</button>
+        <button class="ed-scope-tab" data-scope="global" id="tabGlobal">Global</button>
+      </div>
+    </div>
+
+    <div class="ed-dict-add">
+      <input class="ed-dict-input" id="dictFrom" placeholder="Wrong word / phrase">
+      <span class="ed-dict-arrow">&#8594;</span>
+      <input class="ed-dict-input" id="dictTo" placeholder="Correct form">
+      <button class="ed-btn ed-btn--sm ed-btn--primary" id="btnDictAdd">Add</button>
+    </div>
+
+    <div class="ed-dict-list" id="dictList">
+      <div class="ed-loading">Loading dictionary&hellip;</div>
+    </div>
+
+    <div class="ed-dict-footer">
+      <button class="ed-btn ed-btn--ghost ed-btn--sm" id="btnDictSave">&#10003; Save Dictionary</button>
+      <span class="ed-dict-status" id="dictStatus"></span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Config ───────────────────────────────────────────────────────────────
+const JOB_ID = {{ job_id | tojson }};
+const JOB    = {{ job | tojson }};
+const GROUP  = JOB.group || 'Ungrouped';
+
+// ── State ────────────────────────────────────────────────────────────────
+let wordData      = [];   // [{text, start, end, probability, speaker, seg_idx, word_idx}]
+let segments      = [];   // [{speaker, start, end, words:[...]}]
+let activeWordEl  = null;
+let dictEntries   = {};   // {wrong: correct}
+let dictScope     = 'group';
+let dirty         = false;  // unsaved transcript changes
+let findMatches   = [];
+let findIndex     = -1;
+
+// ── DOM refs ─────────────────────────────────────────────────────────────
+const audioEl       = document.getElementById('audioEl');
+const btnPlayPause  = document.getElementById('btnPlayPause');
+const scrubber      = document.getElementById('scrubber');
+const currentTimeEl = document.getElementById('currentTime');
+const totalTimeEl   = document.getElementById('totalTime');
+const speedSelect   = document.getElementById('speedSelect');
+const edSegments    = document.getElementById('edSegments');
+const edTitle       = document.getElementById('edTitle');
+const btnSave       = document.getElementById('btnSave');
+const btnFindReplace = document.getElementById('btnFindReplace');
+const findBar       = document.getElementById('findBar');
+const findInput     = document.getElementById('findInput');
+const replaceInput  = document.getElementById('replaceInput');
+const findCount     = document.getElementById('findCount');
+const dictList      = document.getElementById('dictList');
+const dictFrom      = document.getElementById('dictFrom');
+const dictTo        = document.getElementById('dictTo');
+const btnDictAdd    = document.getElementById('btnDictAdd');
+const btnDictSave   = document.getElementById('btnDictSave');
+const dictStatus    = document.getElementById('dictStatus');
+
+// ── Language helpers ──────────────────────────────────────────────────────
+function isCJKorThai(text) {
+  for (let i = 0; i < text.length; i++) {
+    const cp = text.codePointAt(i);
+    if (cp >= 0x0E00 && cp <= 0x0E7F) return true;  // Thai
+    if (cp >= 0x4E00 && cp <= 0x9FFF) return true;  // CJK
+  }
+  return false;
+}
+
+function joinWords(words) {
+  if (!words.length) return '';
+  const sample = words.slice(0, 5).join('');
+  if (isCJKorThai(sample)) return words.join('');
+  return words.join(' ');
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────
+async function init() {
+  edTitle.textContent = JOB.filename || JOB_ID;
+  document.title = `Editor — ${JOB.filename || JOB_ID}`;
+
+  // Load audio
+  audioEl.src = `/api/audio/${JOB_ID}`;
+  audioEl.load();
+
+  // Load word data
+  try {
+    const res = await fetch(`/api/words/${JOB_ID}`);
+    if (!res.ok) throw new Error('No word data');
+    const data = await res.json();
+    buildSegments(data);
+    renderSegments();
+  } catch (e) {
+    edSegments.innerHTML = '<div class="ed-error">Word data not available. Re-transcribe the job to enable the editor.</div>';
+  }
+
+  // Load dictionary
+  await loadDictionary();
+}
+
+// ── Segment / word building ───────────────────────────────────────────────
+function buildSegments(data) {
+  // data: {words: [{text, start, end, probability, speaker}], ...}
+  wordData = [];
+  const segsMap = {};  // speaker+start key -> segment
+
+  // Group words into segments by speaker continuity
+  let curSeg = null;
+  (data.words || []).forEach((w, i) => {
+    const spk = w.speaker || 'Speaker 0';
+    if (!curSeg || curSeg.speaker !== spk || (w.start - curSeg.end) > 3.0) {
+      curSeg = { speaker: spk, start: w.start, end: w.end, words: [] };
+      segments.push(curSeg);
+    }
+    curSeg.end = w.end;
+    const wordEntry = {
+      text:        w.text,
+      start:       w.start,
+      end:         w.end,
+      probability: w.probability !== undefined ? w.probability : 1.0,
+      speaker:     spk,
+      seg_idx:     segments.length - 1,
+      word_idx:    curSeg.words.length,
+      edited:      false,
+    };
+    curSeg.words.push(wordEntry);
+    wordData.push(wordEntry);
+  });
+}
+
+function confClass(prob) {
+  if (prob >= 0.85) return 'ed-conf--high';
+  if (prob >= 0.60) return 'ed-conf--mid';
+  return 'ed-conf--low';
+}
+
+function renderSegments() {
+  edSegments.innerHTML = '';
+  segments.forEach((seg, si) => {
+    const row = document.createElement('div');
+    row.className = 'ed-seg';
+    row.dataset.segIdx = si;
+
+    // Play-from-here button
+    const playBtn = document.createElement('button');
+    playBtn.className = 'ed-seg-play';
+    playBtn.title = `Play from ${formatTime(seg.start)}`;
+    playBtn.innerHTML = '&#9654;';
+    playBtn.addEventListener('click', () => seekTo(seg.start));
+    row.appendChild(playBtn);
+
+    // Speaker label
+    const spkEl = document.createElement('span');
+    spkEl.className = 'ed-seg-speaker';
+    spkEl.textContent = seg.speaker;
+    row.appendChild(spkEl);
+
+    // Words container — dual mode: view (spans w/ confidence) / edit (contenteditable)
+    const wordsEl = document.createElement('div');
+    wordsEl.className = 'ed-seg-words';
+    wordsEl.dataset.segIdx = si;
+
+    function renderViewMode() {
+      wordsEl.innerHTML = '';
+      wordsEl.contentEditable = 'false';
+      wordsEl.classList.remove('ed-seg-words--editing');
+      seg.words.forEach((w, wi) => {
+        const span = document.createElement('span');
+        span.className = `ed-word ${confClass(w.probability)}`;
+        span.dataset.segIdx  = si;
+        span.dataset.wordIdx = wi;
+        span.dataset.start   = w.start;
+        span.dataset.end     = w.end;
+        span.title = `${Math.round(w.probability * 100)}% confidence · ${formatTime(w.start)}`;
+        span.textContent = w.text;
+        // Single-click: seek audio
+        span.addEventListener('click', () => seekTo(w.start));
+        wordsEl.appendChild(span);
+        if (!isCJKorThai(w.text)) wordsEl.appendChild(document.createTextNode(' '));
+      });
+      // Click the words area (not on a span) enters edit mode
+      wordsEl.addEventListener('click', (e) => {
+        if (e.target === wordsEl) enterEditMode();
+      }, { once: true });
+    }
+
+    function enterEditMode() {
+      // Build plain text from current word data
+      const plainText = joinWords(seg.words.map(w => w.text));
+      wordsEl.innerHTML = '';
+      wordsEl.contentEditable = 'true';
+      wordsEl.classList.add('ed-seg-words--editing');
+      wordsEl.textContent = plainText;
+      wordsEl.focus();
+      // Place cursor at end
+      const range = document.createRange();
+      const sel = window.getSelection();
+      range.selectNodeContents(wordsEl);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+
+      function saveEdit() {
+        const newText = wordsEl.textContent.trim();
+        if (newText !== plainText && newText !== '') {
+          // Split back into words preserving timing — assign new text proportionally
+          const newWords = isCJKorThai(newText)
+            ? newText.split('') .filter(Boolean)
+            : newText.split(/\s+/).filter(Boolean);
+          // Remap word texts (timing stays the same, truncate/extend as needed)
+          const oldWords = seg.words;
+          seg.words = newWords.map((t, i) => ({
+            text:        t,
+            start:       oldWords[i] ? oldWords[i].start : (oldWords[oldWords.length-1]?.end || 0),
+            end:         oldWords[i] ? oldWords[i].end   : (oldWords[oldWords.length-1]?.end || 0),
+            probability: oldWords[i] ? oldWords[i].probability : 1.0,
+          }));
+          // Also update wordData array
+          wordData = wordData.filter(w => w.seg_idx !== si);
+          seg.words.forEach((w, wi) => {
+            wordData.push({ ...w, seg_idx: si, word_idx: wi, edited: true });
+          });
+          wordData.sort((a, b) => a.start - b.start);
+          markDirty();
+        }
+        wordsEl.contentEditable = 'false';
+        wordsEl.classList.remove('ed-seg-words--editing');
+        renderViewMode();
+      }
+
+      wordsEl.addEventListener('blur', saveEdit, { once: true });
+      wordsEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); wordsEl.blur(); }
+        if (e.key === 'Escape') {
+          wordsEl.textContent = plainText;
+          wordsEl.blur();
+        }
+      });
+    }
+
+    // Edit icon click → enter edit mode directly
+    const editIconBtn = document.createElement('button');
+    editIconBtn.className = 'ed-seg-edit-btn';
+    editIconBtn.title = 'Edit segment text (or click any word)';
+    editIconBtn.innerHTML = '&#9998;';
+    editIconBtn.addEventListener('click', () => enterEditMode());
+    row.appendChild(editIconBtn);
+
+    renderViewMode();
+    // Click anywhere in the words area in view mode enters edit mode
+    wordsEl.addEventListener('click', (e) => {
+      if (!wordsEl.isContentEditable || wordsEl.contentEditable === 'false') {
+        if (e.target === wordsEl) enterEditMode();
+      }
+    });
+
+    row.appendChild(wordsEl);
+    edSegments.appendChild(row);
+  });
+}
+
+// ── Inline word editing ───────────────────────────────────────────────────
+function startEditing(span, si, wi) {
+  span.contentEditable = 'true';
+  span.classList.add('ed-word--editing');
+  span.focus();
+
+  const original = span.textContent;
+
+  function finish() {
+    span.contentEditable = 'false';
+    span.classList.remove('ed-word--editing');
+    const newText = span.textContent.trim();
+    if (newText !== original && newText !== '') {
+      segments[si].words[wi].text = newText;
+      segments[si].words[wi].edited = true;
+      // Find in wordData and update
+      const wd = wordData.find(w => w.seg_idx === si && w.word_idx === wi);
+      if (wd) wd.text = newText;
+      markDirty();
+    } else if (!newText) {
+      span.textContent = original;
+    }
+    span.removeEventListener('blur', finish);
+    span.removeEventListener('keydown', onKey);
+  }
+
+  function onKey(e) {
+    if (e.key === 'Enter') { e.preventDefault(); finish(); }
+    if (e.key === 'Escape') { span.textContent = original; finish(); }
+  }
+
+  span.addEventListener('blur', finish);
+  span.addEventListener('keydown', onKey);
+}
+
+// ── Audio playback ────────────────────────────────────────────────────────
+audioEl.addEventListener('loadedmetadata', () => {
+  scrubber.max = audioEl.duration;
+  totalTimeEl.textContent = formatTime(audioEl.duration);
+});
+
+audioEl.addEventListener('timeupdate', () => {
+  const t = audioEl.currentTime;
+  scrubber.value = t;
+  currentTimeEl.textContent = formatTime(t);
+  highlightCurrentWord(t);
+});
+
+audioEl.addEventListener('play',  () => { btnPlayPause.innerHTML = '&#9646;&#9646;'; });
+audioEl.addEventListener('pause', () => { btnPlayPause.innerHTML = '&#9654;'; });
+audioEl.addEventListener('ended', () => { btnPlayPause.innerHTML = '&#9654;'; });
+
+btnPlayPause.addEventListener('click', () => {
+  if (audioEl.paused) audioEl.play(); else audioEl.pause();
+});
+
+scrubber.addEventListener('input', () => {
+  audioEl.currentTime = parseFloat(scrubber.value);
+});
+
+speedSelect.addEventListener('change', () => {
+  audioEl.playbackRate = parseFloat(speedSelect.value);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.isContentEditable || e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.code === 'Space') { e.preventDefault(); if (audioEl.paused) audioEl.play(); else audioEl.pause(); }
+  if (e.code === 'ArrowLeft')  audioEl.currentTime = Math.max(0, audioEl.currentTime - 5);
+  if (e.code === 'ArrowRight') audioEl.currentTime = Math.min(audioEl.duration, audioEl.currentTime + 5);
+});
+
+function seekTo(t) {
+  audioEl.currentTime = t;
+  if (audioEl.paused) audioEl.play();
+}
+
+function highlightCurrentWord(t) {
+  // Binary search for current word
+  let lo = 0, hi = wordData.length - 1, found = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (wordData[mid].end < t) lo = mid + 1;
+    else if (wordData[mid].start > t) hi = mid - 1;
+    else { found = mid; break; }
+  }
+  if (found === null && lo > 0) found = lo - 1;
+
+  if (found !== null) {
+    const w = wordData[found];
+    const sel = edSegments.querySelector(
+      `[data-seg-idx="${w.seg_idx}"][data-word-idx="${w.word_idx}"]`
+    );
+    if (sel && sel !== activeWordEl) {
+      if (activeWordEl) activeWordEl.classList.remove('ed-word--active');
+      sel.classList.add('ed-word--active');
+      activeWordEl = sel;
+      // Auto-scroll to keep active word visible
+      sel.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }
+}
+
+// ── Save ──────────────────────────────────────────────────────────────────
+function buildTranscriptText() {
+  return segments.map(seg => {
+    const joined = joinWords(seg.words.map(w => w.text));
+    return `[${seg.speaker}]: ${joined}`;
+  }).join('\n\n');
+}
+
+btnSave.addEventListener('click', async () => {
+  btnSave.disabled = true;
+  btnSave.textContent = 'Saving…';
+  try {
+    const fd = new FormData();
+    fd.append('content', buildTranscriptText());
+    const res = await fetch(`/api/transcript/${JOB_ID}`, { method: 'POST', body: fd });
+    if (!res.ok) throw new Error('Save failed');
+    dirty = false;
+    btnSave.textContent = 'Saved ✓';
+    setTimeout(() => { btnSave.textContent = 'Save Transcript'; btnSave.disabled = false; }, 2000);
+  } catch (e) {
+    btnSave.textContent = 'Error saving';
+    setTimeout(() => { btnSave.textContent = 'Save Transcript'; btnSave.disabled = false; }, 2000);
+  }
+});
+
+function markDirty() {
+  dirty = true;
+  btnSave.classList.add('ed-btn--dirty');
+}
+
+window.addEventListener('beforeunload', (e) => {
+  if (dirty) { e.preventDefault(); e.returnValue = ''; }
+});
+
+// ── Find & Replace ────────────────────────────────────────────────────────
+btnFindReplace.addEventListener('click', () => toggleFindBar());
+document.getElementById('btnCloseFindBar').addEventListener('click', () => toggleFindBar(false));
+
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'h') { e.preventDefault(); toggleFindBar(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); toggleFindBar(true); }
+});
+
+function toggleFindBar(show) {
+  const visible = show !== undefined ? show : findBar.hidden;
+  findBar.hidden = !visible;
+  if (visible) { findInput.focus(); findInput.select(); runFind(); }
+  else clearFindHighlights();
+}
+
+findInput.addEventListener('input', runFind);
+
+document.getElementById('btnFindNext').addEventListener('click', () => moveFindIndex(1));
+document.getElementById('btnFindPrev').addEventListener('click', () => moveFindIndex(-1));
+
+document.getElementById('btnReplaceOne').addEventListener('click', () => {
+  if (findIndex < 0 || findMatches.length === 0) return;
+  const m = findMatches[findIndex];
+  const span = edSegments.querySelector(`[data-seg-idx="${m.si}"][data-word-idx="${m.wi}"]`);
+  if (span) {
+    span.textContent = replaceInput.value;
+    segments[m.si].words[m.wi].text = replaceInput.value;
+    const wd = wordData.find(w => w.seg_idx === m.si && w.word_idx === m.wi);
+    if (wd) wd.text = replaceInput.value;
+    markDirty();
+    runFind();
+  }
+});
+
+document.getElementById('btnReplaceAll').addEventListener('click', () => {
+  const query = findInput.value.trim().toLowerCase();
+  if (!query) return;
+  let count = 0;
+  wordData.forEach(w => {
+    if (w.text.toLowerCase().includes(query)) {
+      const newText = w.text.replace(new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'gi'), replaceInput.value);
+      w.text = newText;
+      segments[w.seg_idx].words[w.word_idx].text = newText;
+      count++;
+    }
+  });
+  if (count) { markDirty(); renderSegments(); }
+  findCount.textContent = `Replaced ${count}`;
+  runFind();
+});
+
+function runFind() {
+  clearFindHighlights();
+  findMatches = [];
+  findIndex = -1;
+  const query = findInput.value.trim().toLowerCase();
+  if (!query) { findCount.textContent = ''; return; }
+  wordData.forEach(w => {
+    if (w.text.toLowerCase().includes(query)) {
+      findMatches.push({ si: w.seg_idx, wi: w.word_idx });
+    }
+  });
+  highlightFindMatches();
+  findCount.textContent = `${findMatches.length} match${findMatches.length !== 1 ? 'es' : ''}`;
+  if (findMatches.length) moveFindIndex(1);
+}
+
+function highlightFindMatches() {
+  findMatches.forEach(m => {
+    const span = edSegments.querySelector(`[data-seg-idx="${m.si}"][data-word-idx="${m.wi}"]`);
+    if (span) span.classList.add('ed-word--found');
+  });
+}
+
+function clearFindHighlights() {
+  edSegments.querySelectorAll('.ed-word--found,.ed-word--find-current').forEach(el => {
+    el.classList.remove('ed-word--found', 'ed-word--find-current');
+  });
+}
+
+function moveFindIndex(dir) {
+  if (!findMatches.length) return;
+  // Remove current highlight
+  if (findIndex >= 0) {
+    const m = findMatches[findIndex];
+    const span = edSegments.querySelector(`[data-seg-idx="${m.si}"][data-word-idx="${m.wi}"]`);
+    if (span) span.classList.remove('ed-word--find-current');
+  }
+  findIndex = (findIndex + dir + findMatches.length) % findMatches.length;
+  const m = findMatches[findIndex];
+  const span = edSegments.querySelector(`[data-seg-idx="${m.si}"][data-word-idx="${m.wi}"]`);
+  if (span) {
+    span.classList.add('ed-word--find-current');
+    span.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+  findCount.textContent = `${findIndex + 1} / ${findMatches.length}`;
+}
+
+// ── Dictionary ────────────────────────────────────────────────────────────
+async function loadDictionary() {
+  try {
+    const url = dictScope === 'global'
+      ? `/api/dictionary?scope=global`
+      : `/api/dictionary?group=${encodeURIComponent(GROUP)}&scope=group`;
+    const res = await fetch(url);
+    const data = await res.json();
+    dictEntries = dictScope === 'global' ? (data.entries || {}) : (data.group_entries || {});
+    renderDict();
+  } catch (e) {
+    dictList.innerHTML = '<div class="ed-error">Failed to load dictionary</div>';
+  }
+}
+
+function renderDict() {
+  dictList.innerHTML = '';
+  const keys = Object.keys(dictEntries).sort();
+  if (!keys.length) {
+    dictList.innerHTML = '<div class="ed-dict-empty">No entries yet. Add corrections above.</div>';
+    return;
+  }
+  keys.forEach(k => {
+    const row = document.createElement('div');
+    row.className = 'ed-dict-row';
+    row.innerHTML = `<span class="ed-dict-from">${escHtml(k)}</span>
+      <span class="ed-dict-arr">&#8594;</span>
+      <span class="ed-dict-to">${escHtml(dictEntries[k])}</span>
+      <button class="ed-dict-del" data-key="${escHtml(k)}" title="Remove">&times;</button>`;
+    row.querySelector('.ed-dict-del').addEventListener('click', () => {
+      delete dictEntries[k];
+      renderDict();
+    });
+    dictList.appendChild(row);
+  });
+}
+
+btnDictAdd.addEventListener('click', () => {
+  const from = dictFrom.value.trim();
+  const to   = dictTo.value.trim();
+  if (!from || !to) return;
+  dictEntries[from] = to;
+  dictFrom.value = '';
+  dictTo.value = '';
+  renderDict();
+  dictFrom.focus();
+});
+
+dictTo.addEventListener('keydown', (e) => { if (e.key === 'Enter') btnDictAdd.click(); });
+
+btnDictSave.addEventListener('click', async () => {
+  btnDictSave.disabled = true;
+  dictStatus.textContent = 'Saving…';
+  try {
+    const fd = new FormData();
+    fd.append('entries', JSON.stringify(dictEntries));
+    fd.append('group', GROUP);
+    fd.append('scope', dictScope);
+    const res = await fetch('/api/dictionary', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error();
+    dictStatus.textContent = `Saved ${Object.keys(dictEntries).length} entries`;
+  } catch {
+    dictStatus.textContent = 'Error saving';
+  }
+  btnDictSave.disabled = false;
+  setTimeout(() => { dictStatus.textContent = ''; }, 3000);
+});
+
+// Scope tabs
+document.getElementById('tabGroup').addEventListener('click', () => setDictScope('group'));
+document.getElementById('tabGlobal').addEventListener('click', () => setDictScope('global'));
+
+function setDictScope(scope) {
+  dictScope = scope;
+  document.getElementById('tabGroup').classList.toggle('ed-scope-tab--active', scope === 'group');
+  document.getElementById('tabGlobal').classList.toggle('ed-scope-tab--active', scope === 'global');
+  loadDictionary();
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────
+function formatTime(s) {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Go ────────────────────────────────────────────────────────────────────
+init();
+</script>
+</body>
+</html>
