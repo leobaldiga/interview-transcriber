@@ -1,4 +1,4 @@
-# Interview Transcriber v5
+# Interview Transcriber
 
 Local webapp for transcribing and diarizing research interview audio.
 
