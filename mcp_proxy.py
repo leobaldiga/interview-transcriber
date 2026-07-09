@@ -1,0 +1,481 @@
+"""
+whisper-mcp proxy — exposes the Interview Transcriber app (FastAPI on :8765)
+to Gemma / Open WebUI as an MCP (Streamable HTTP) tool server.
+
+This is a thin proxy: it owns no models and does no GPU work. It discovers
+audio files in the app's uploads/ dir, submits transcription jobs through the
+app's existing /api/transcribe endpoint (so outputs land in
+outputs/<group>/<job_id>/ exactly as the web UI produces them), polls job
+status, and returns transcript content for completed jobs.
+
+Transport: Streamable HTTP at /mcp on port 8002 (matches the SearXNG MCP
+pattern already used in the gemma-stack Open WebUI setup). Note: with mcp >= 1.28
+the endpoint is /mcp (NO trailing slash) — /mcp/ 307-redirects to /mcp.
+
+Run:
+    ./.venv/bin/pip install -r requirements-mcp.txt
+    ./.venv/bin/python mcp_proxy.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import httpx
+from mcp.server.fastmcp import FastMCP
+
+# --- Configuration (env-overridable) -----------------------------------------
+TRANSCRIBER_URL = os.getenv("TRANSCRIBER_URL", "http://localhost:8765").rstrip("/")
+# Repo root of the interview-transcriber app (where uploads/ and outputs/ live).
+TRANSCRIBER_DIR = Path(os.getenv("TRANSCRIBER_DIR", Path(__file__).resolve().parent))
+UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", TRANSCRIBER_DIR / "uploads"))
+OUTPUTS_DIR = Path(os.getenv("OUTPUTS_DIR", TRANSCRIBER_DIR / "outputs"))
+JOBS_INDEX = OUTPUTS_DIR / "jobs.json"
+
+PORT = int(os.getenv("PORT", "8002"))
+HOST = os.getenv("HOST", "0.0.0.0")
+# Warn (non-blocking) when free VRAM drops below this many MiB.
+VRAM_WARN_MB = int(os.getenv("VRAM_WARN_MB", "2048"))
+# Truncate transcript text returned in get_job() to keep tool responses small.
+MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "60000"))
+
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".mp4", ".webm", ".aac"}
+
+mcp = FastMCP("interview-transcriber")
+
+
+# --- Whisper model catalogue (static; VRAM figures are faster-whisper int8 --- 
+# --- on CUDA, which app.py forces for cuda device) ---------------------------
+
+WHISPER_MODELS: list[dict[str, Any]] = [
+    {
+        "model": "large-v3-turbo",
+        "params": "809M",
+        "vram_gb": "~1.5-2.5",
+        "speed": "~8x realtime on RTX 3060",
+        "accuracy": "Near large-v3; ~3-4% WER",
+        "note": "App default. Best co-resident choice alongside Gemma (low VRAM, fast).",
+    },
+    {
+        "model": "large-v3",
+        "params": "1550M",
+        "vram_gb": "~2.5-3.5",
+        "speed": "~8x realtime on RTX 3060",
+        "accuracy": "Best (~2.7% WER)",
+        "note": "Max accuracy. Use when Gemma is idle or VRAM headroom is ample.",
+    },
+    {
+        "model": "large-v2",
+        "params": "1550M",
+        "vram_gb": "~2.5-3.5",
+        "speed": "~8x realtime on RTX 3060",
+        "accuracy": "~2.4% WER (EN)",
+        "note": "Legacy large model; rarely preferred over large-v3.",
+    },
+    {
+        "model": "distil-large-v3",
+        "params": "~756M",
+        "vram_gb": "~1.5",
+        "speed": "~6x faster than large-v3",
+        "accuracy": "Within ~1% WER of large-v3",
+        "note": "Distilled; great speed/VRAM, English-centric.",
+    },
+    {
+        "model": "medium",
+        "params": "769M",
+        "vram_gb": "~2.0",
+        "speed": "~2x realtime",
+        "accuracy": "~3.5% WER (EN)",
+        "note": "Light fallback if VRAM is very tight.",
+    },
+    {
+        "model": "small",
+        "params": "244M",
+        "vram_gb": "~1.0",
+        "speed": "~4x realtime",
+        "accuracy": "Good for clean audio / drafts",
+        "note": "Very light; useful when Gemma is fully loaded.",
+    },
+    # Thai-specific models referenced by app.py (process_job _th_models set)
+    {
+        "model": "nectec/Pathumma-whisper-th-large-v3",
+        "params": "large",
+        "vram_gb": "~3.0",
+        "speed": "large-class",
+        "accuracy": "Tuned for Thai",
+        "note": "Thai language; app forces language='th' when auto-detected.",
+    },
+    {
+        "model": "nectec/Pathumma-whisper-th-medium",
+        "params": "medium",
+        "vram_gb": "~2.0",
+        "speed": "medium-class",
+        "accuracy": "Tuned for Thai",
+        "note": "Lighter Thai option.",
+    },
+    {
+        "model": "Vinxscribe/biodatlab-whisper-th-large-v3-faster",
+        "params": "large",
+        "vram_gb": "~3.0",
+        "speed": "large-class",
+        "accuracy": "Tuned for Thai (CTranslate2)",
+        "note": "Thai language; faster-whisper native.",
+    },
+]
+_VALID_MODELS = {m["model"] for m in WHISPER_MODELS}
+
+
+# --- Helpers -----------------------------------------------------------------
+
+def _probe_duration(path: Path) -> float | None:
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            stderr=subprocess.DEVNULL, timeout=15,
+        ).decode().strip()
+        return float(out)
+    except Exception:
+        return None
+
+
+def _load_jobs_index() -> list[dict]:
+    try:
+        if JOBS_INDEX.exists():
+            return json.loads(JOBS_INDEX.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
+def _transcribed_filenames() -> set[str]:
+    """Original filenames that have at least one completed job."""
+    done: set[str] = set()
+    for j in _load_jobs_index():
+        if j.get("status") == "complete" and j.get("filename"):
+            done.add(j["filename"])
+    return done
+
+
+def _list_uploads() -> list[dict]:
+    if not UPLOADS_DIR.exists():
+        return []
+    done = _transcribed_filenames()
+    out = []
+    for p in sorted(UPLOADS_DIR.iterdir()):
+        if not p.is_file() or p.suffix.lower() not in AUDIO_EXTS:
+            continue
+        out.append({
+            "name": p.name,
+            "path": str(p),
+            "size_mb": round(p.stat().st_size / 1024 / 1024, 1),
+            "duration_s": _probe_duration(p),
+            "transcribed": p.name in done,
+        })
+    return out
+
+
+async def _get_vram() -> dict[str, Any] | None:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(f"{TRANSCRIBER_URL}/api/vram")
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return None
+
+
+def _parse_free_vram_mb(vram: dict | None) -> int | None:
+    if not vram:
+        return None
+    try:
+        total = float(vram.get("vram_total", "").split()[0]) if vram.get("vram_total") else None
+        used = float(vram.get("vram_used", "").split()[0]) if vram.get("vram_used") else None
+        if total is not None and used is not None:
+            return int((total - used) * 1024)
+    except Exception:
+        pass
+    return None
+
+
+# --- Tools -------------------------------------------------------------------
+
+@mcp.tool()
+def list_whisper_models() -> dict:
+    """List available Whisper transcription models with VRAM / speed / accuracy notes.
+
+    All models run via faster-whisper in int8 on CUDA (the app forces int8 on GPU),
+    so the VRAM figures are the co-resident footprint alongside Gemma on storm1's
+    RTX 3060 (12 GB).
+
+    IMPORTANT for the assistant: before calling transcribe_audio(), you MUST ask
+    the user which model to use. Present these options (call this tool to fetch
+    them) and let the user choose. Default recommendation when unsure:
+    'large-v3-turbo' (low VRAM, fast, near-large-v3 accuracy).
+    """
+    return {
+        "default": "large-v3-turbo",
+        "coresident_note": (
+            "storm1 RTX 3060 has 12 GB VRAM shared with the Gemma llama.cpp server. "
+            "Prefer large-v3-turbo (~2 GB) when Gemma is loaded; use large-v3 (~3 GB) "
+            "for max accuracy when Gemma is idle."
+        ),
+        "models": WHISPER_MODELS,
+    }
+
+
+@mcp.tool()
+def list_audio_files() -> dict:
+    """List audio files available for transcription from the app's uploads/ dir.
+
+    Returns name, path, size (MB), duration (s), and whether the file has already
+    been transcribed (a completed job exists for it). Drop new files into the
+    app's uploads/ directory on the host to make them appear here.
+
+    Pass any 'path' (or 'name') to transcribe_audio().
+    """
+    files = _list_uploads()
+    return {
+        "uploads_dir": str(UPLOADS_DIR),
+        "count": len(files),
+        "files": files,
+        "note": "Pass a 'path' value to transcribe_audio(). Files with "
+                "'transcribed': true already have a completed transcript.",
+    }
+
+
+@mcp.tool()
+async def transcribe_audio(
+    audio_path: str,
+    whisper_model: str,
+    language: str = "auto",
+    num_speakers: int = 0,
+    group: str = "MCP",
+) -> dict:
+    """Submit an audio file for transcription + diarization through the Interview Transcriber app.
+
+    IMPORTANT for the assistant: you MUST confirm the whisper model choice with
+    the user before calling this tool. Call list_whisper_models() to show options.
+    If whisper_model is empty or not in the supported list, this tool returns the
+    model list and asks you to re-call with a valid model.
+
+    The job runs on the app's existing async queue (one GPU job at a time), so it
+    returns immediately with a job_id. Poll get_job(job_id) until status == 'done'.
+
+    Args:
+        audio_path: Path to the audio file. Absolute, or a name resolved under the
+            app's uploads/ dir (e.g. "20260401_ARINT003.mp3"). Use list_audio_files().
+        whisper_model: REQUIRED. One of the models from list_whisper_models().
+        language: ISO 639-1 code (e.g. "en", "th") or "auto" to auto-detect.
+            Set explicitly for best non-English accuracy.
+        num_speakers: Optional hint for diarization (exact speaker count).
+        group: Output group name (creates outputs/<group>/<job_id>/). Default "MCP".
+
+    Returns:
+        {job_id, status:"queued", vram, warning?} on success,
+        {error, models} if whisper_model is invalid.
+    """
+    # Validate model choice — enforce the "ask the user first" contract.
+    if not whisper_model or whisper_model not in _VALID_MODELS:
+        return {
+            "error": (
+                f"whisper_model '{whisper_model}' is not in the supported list. "
+                "Ask the user which model to use, then re-call with a valid value."
+            ),
+            "supported_models": WHISPER_MODELS,
+            "default": "large-v3-turbo",
+        }
+
+    # Resolve the audio file (absolute path, or name under uploads/).
+    p = Path(audio_path)
+    if not p.is_absolute():
+        p = UPLOADS_DIR / audio_path
+    if not p.exists():
+        return {
+            "error": f"Audio file not found: {p}. Use list_audio_files() to see "
+                     f"available files in {UPLOADS_DIR}.",
+            "uploads_dir": str(UPLOADS_DIR),
+        }
+
+    # Pre-flight VRAM check (non-blocking warn + suggest).
+    vram = await _get_vram()
+    free_mb = _parse_free_vram_mb(vram)
+    warning = None
+    if free_mb is not None and free_mb < VRAM_WARN_MB:
+        warning = (
+            f"Low free VRAM (~{free_mb} MiB free). Gemma may be loaded. Consider a "
+            "lighter model (large-v3-turbo / medium / small) or wait for Gemma to "
+            "idle. Job submitted anyway — the app's queue serializes GPU work."
+        )
+
+    # Submit via the app's existing multipart endpoint (loopback). Streams the file
+    # from disk so multi-GB interviews don't load fully into memory.
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=5.0)) as c:
+            with open(p, "rb") as fh:
+                resp = await c.post(
+                    f"{TRANSCRIBER_URL}/api/transcribe",
+                    files={"file": (p.name, fh, "application/octet-stream")},
+                    data={
+                        "language": language,
+                        "num_speakers": "" if num_speakers <= 0 else str(num_speakers),
+                        "group": group,
+                        "whisper_model": whisper_model,
+                    },
+                )
+            resp.raise_for_status()
+            job_id = resp.json().get("job_id")
+    except httpx.HTTPStatusError as e:
+        return {"error": f"Transcriber rejected the job: {e.response.status_code} "
+                         f"{e.response.text[:300]}"}
+    except Exception as e:
+        return {"error": f"Failed to submit job: {type(e).__name__}: {e}"}
+
+    if not job_id:
+        return {"error": "Transcriber did not return a job_id."}
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "whisper_model": whisper_model,
+        "language": language,
+        "group": group,
+        "filename": p.name,
+        "vram": vram,
+        "warning": warning,
+        "poll": f"Call get_job(\"{job_id}\") to check progress.",
+    }
+
+
+@mcp.tool()
+async def get_job(job_id: str) -> dict:
+    """Get status + result of a transcription job. Poll until status == 'done'.
+
+    Maps the app's job statuses (queued / transcribing / diarizing / merging /
+    building_outputs / complete / error) to running / done / error.
+
+    When done, includes:
+      transcript        - diarized text (truncated to MAX_TRANSCRIPT_CHARS; full
+                          text is at transcript_path)
+      transcript_path   - outputs/<group>/<job_id>/<stem>.txt
+      srt_path, json_path
+      language, duration_s, num_speakers, whisper_model
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.get(f"{TRANSCRIBER_URL}/api/jobs/{job_id}")
+            if r.status_code == 404:
+                return {"status": "error", "error": f"Unknown job_id: {job_id}"}
+            r.raise_for_status()
+            job = r.json()
+    except Exception as e:
+        return {"status": "error", "error": f"Failed to fetch job: {type(e).__name__}: {e}"}
+
+    status = job.get("status", "")
+    if status in ("queued", "transcribing", "diarizing", "merging", "building_outputs"):
+        return {
+            "job_id": job_id,
+            "status": "running",
+            "step": job.get("step"),
+            "filename": job.get("filename"),
+        }
+    if status == "error":
+        return {
+            "job_id": job_id,
+            "status": "error",
+            "error": job.get("error") or "job failed",
+            "step": job.get("step"),
+        }
+
+    # status == "complete" — fetch the transcript text.
+    transcript = ""
+    files = job.get("files", {}) or {}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            pr = await c.get(f"{TRANSCRIBER_URL}/api/preview/{job_id}/txt")
+            if pr.status_code == 200:
+                transcript = pr.json().get("content", "")
+    except Exception:
+        pass
+
+    truncated = False
+    if len(transcript) > MAX_TRANSCRIPT_CHARS:
+        transcript = (
+            transcript[:MAX_TRANSCRIPT_CHARS]
+            + f"\n...[truncated {len(transcript) - MAX_TRANSCRIPT_CHARS} chars; "
+            f"full text at {files.get('txt')}]"
+        )
+        truncated = True
+
+    duration_s = job.get("duration")
+    return {
+        "job_id": job_id,
+        "status": "done",
+        "filename": job.get("filename"),
+        "language": job.get("language"),
+        "duration_s": duration_s,
+        "num_speakers": job.get("num_speakers"),
+        "whisper_model": job.get("whisper_model"),
+        "group": job.get("group"),
+        "transcript": transcript,
+        "truncated": truncated,
+        "transcript_path": files.get("txt"),
+        "srt_path": files.get("srt"),
+        "json_path": files.get("json"),
+        "audio_path": job.get("audio_path") or files.get("audio"),
+    }
+
+
+@mcp.tool()
+async def list_jobs() -> dict:
+    """List all transcription jobs known to the app (lightweight: no transcript bodies).
+
+    Each entry has id, filename, group, status, language, duration, num_speakers,
+    created_at, completed_at. Use get_job(id) for the full transcript of a completed job.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.get(f"{TRANSCRIBER_URL}/api/jobs")
+            r.raise_for_status()
+            jobs = r.json()
+    except Exception as e:
+        return {"error": f"Failed to list jobs: {type(e).__name__}: {e}"}
+
+    return {
+        "count": len(jobs),
+        "jobs": [
+            {
+                "id": j.get("id"),
+                "filename": j.get("filename"),
+                "group": j.get("group"),
+                "status": j.get("status"),
+                "language": j.get("language"),
+                "duration": j.get("duration"),
+                "num_speakers": j.get("num_speakers"),
+                "created_at": j.get("created_at"),
+                "completed_at": j.get("completed_at"),
+            }
+            for j in jobs
+        ],
+    }
+
+
+# --- Run as Streamable HTTP at /mcp (no trailing slash) ----------------------
+# Matches the SearXNG MCP pattern Open WebUI already consumes:
+#   Admin Panel -> Settings -> External Tools -> + -> Type: MCP (Streamable HTTP)
+#   URL: http://<storm1-tailscale-ip>:8002/mcp   (NO trailing slash with mcp >= 1.28;
+#   /mcp/ 307-redirects to /mcp and drops the POST body)
+
+def _make_app():
+    return mcp.streamable_http_app()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print(f"[whisper-mcp] proxying {TRANSCRIBER_URL} | uploads={UPLOADS_DIR}")
+    print(f"[whisper-mcp] MCP endpoint: http://{HOST}:{PORT}/mcp  (no trailing slash)")
+    uvicorn.run(_make_app(), host=HOST, port=PORT, log_level="info")

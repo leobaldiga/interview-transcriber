@@ -1,0 +1,43 @@
+# whisper-mcp proxy — systemd user service for storm1
+# Exposes the Interview Transcriber app (:8765) as an MCP Streamable HTTP
+# endpoint at :8002/mcp (no trailing slash) for Gemma / Open WebUI.
+#
+# Install (as your user, not root):
+#   mkdir -p ~/.config/systemd/user
+#   cp whisper-mcp.service ~/.config/systemd/user/
+#   # edit the paths below to match your interview-transcriber checkout
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now whisper-mcp
+#   systemctl --user status whisper-mcp
+#
+# Enable lingering so the service runs when you're not SSH'd in:
+#   sudo loginctl enable-linger $USER
+#
+# Logs:
+#   journalctl --user -u whisper-mcp -f
+
+[Unit]
+Description=whisper-mcp proxy (MCP for Interview Transcriber)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Path to the interview-transcriber checkout (contains app.py, .venv, uploads/, outputs/)
+WorkingDirectory=%h/interview-transcriber
+# Use the app's own venv; install deps with:
+#   ./.venv/bin/pip install -r requirements-mcp.txt
+ExecStart=%h/interview-transcriber/.venv/bin/python %h/interview-transcriber/mcp_proxy.py
+# Point at the running transcriber app + its uploads/outputs dirs
+Environment=TRANSCRIBER_URL=http://localhost:8765
+Environment=TRANSCRIBER_DIR=%h/interview-transcriber
+Environment=UPLOADS_DIR=%h/interview-transcriber/uploads
+Environment=OUTPUTS_DIR=%h/interview-transcriber/outputs
+Environment=HOST=0.0.0.0
+Environment=PORT=8002
+Environment=VRAM_WARN_MB=2048
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
