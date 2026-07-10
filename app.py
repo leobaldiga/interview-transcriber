@@ -444,8 +444,10 @@ def diarize_audio(audio_path: str, num_speakers: Optional[int] = None, job: Opti
                 "audio_path": audio_path,
                 "hf_token": HF_TOKEN,
                 "num_speakers": num_speakers,
-                "min_silence": _adv.get("min_silence", 0.5),
-                "min_cluster_size": _adv.get("min_cluster_size", 75),
+                # Harmonized with the API form defaults (see /api/transcribe) so
+                # every code path uses the same, looser diarization params.
+                "min_silence": _adv.get("min_silence", 0.7),
+                "min_cluster_size": _adv.get("min_cluster_size", 35),
                 "seg_onset": _adv.get("seg_onset", 0.6),
                 "seg_offset": _adv.get("seg_offset", 0.4),
             },
@@ -520,25 +522,74 @@ def diarize_audio(audio_path: str, num_speakers: Optional[int] = None, job: Opti
                     pass
 
 
+def _best_speaker_for_span(start: float, end: float, diarization_turns: list) -> str:
+    """Return the speaker whose diarization turn(s) cover the most of [start, end].
+
+    Uses total temporal overlap (summed across turns per speaker) rather than a
+    single midpoint test. This is robust for both short word spans and long
+    segment spans, and never depends on a single instant near a turn boundary.
+    """
+    if end < start:
+        start, end = end, start
+    overlap_by_speaker: dict = {}
+    for turn in diarization_turns:
+        ov = min(end, turn["end"]) - max(start, turn["start"])
+        if ov > 0:
+            overlap_by_speaker[turn["speaker"]] = overlap_by_speaker.get(turn["speaker"], 0.0) + ov
+    if overlap_by_speaker:
+        return max(overlap_by_speaker, key=overlap_by_speaker.get)
+
+    # No overlap (word/segment falls in a diarization gap): snap to nearest turn.
+    mid = (start + end) / 2
+    best_speaker = "UNKNOWN"
+    best_dist = None
+    for turn in diarization_turns:
+        if turn["start"] <= mid <= turn["end"]:
+            dist = 0.0
+        elif mid < turn["start"]:
+            dist = turn["start"] - mid
+        else:
+            dist = mid - turn["end"]
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_speaker = turn["speaker"]
+    return best_speaker
+
+
 def assign_speakers_to_words(segments: list, diarization_turns: list) -> list:
+    """Assign a speaker to every word.
+
+    For space-delimited languages we keep per-word assignment (each Whisper word
+    is a real word). For Thai/CJK, faster-whisper emits one "word" per character
+    or tone-mark, so per-word assignment shatters a single utterance across
+    speakers at every diarization boundary. For those scripts we instead pick ONE
+    speaker for the whole Whisper segment (a coherent phrase/sentence) by maximum
+    total overlap, and every word in the segment inherits it. Output shape is
+    unchanged (a flat word list), so all downstream builders keep working.
+    """
     words = []
     for seg in segments:
+        seg_words = []
         for w in seg.get("words", []):
             if "text" not in w or "start" not in w or "end" not in w:
                 continue
-            words.append({"text": w["text"], "start": w["start"], "end": w["end"], "speaker": None})
+            seg_words.append({"text": w["text"], "start": w["start"], "end": w["end"], "speaker": None})
+        if not seg_words:
+            continue
 
-    for word in words:
-        mid = (word["start"] + word["end"]) / 2
-        best_speaker = "UNKNOWN"
-        best_overlap = 0
-        for turn in diarization_turns:
-            if turn["start"] <= mid <= turn["end"]:
-                overlap = min(word["end"], turn["end"]) - max(word["start"], turn["start"])
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_speaker = turn["speaker"]
-        word["speaker"] = best_speaker
+        # Decide granularity per segment based on its script.
+        seg_text = seg.get("text", "") or "".join(sw["text"] for sw in seg_words)
+        if _is_cjk_or_thai(seg_text):
+            seg_start = min(sw["start"] for sw in seg_words)
+            seg_end = max(sw["end"] for sw in seg_words)
+            seg_speaker = _best_speaker_for_span(seg_start, seg_end, diarization_turns)
+            for sw in seg_words:
+                sw["speaker"] = seg_speaker
+        else:
+            for sw in seg_words:
+                sw["speaker"] = _best_speaker_for_span(sw["start"], sw["end"], diarization_turns)
+        words.extend(seg_words)
+
     return words
 
 
@@ -558,7 +609,8 @@ def _join_words(words: list) -> str:
 
 
 def _merge_short_turns(labeled_words: list, min_turn_duration: float = 1.5,
-                       min_word_count: int = 4, max_speakers: Optional[int] = None) -> list:
+                       min_word_count: int = 4, max_speakers: Optional[int] = None,
+                       min_cjk_turn_chars: int = 6) -> list:
     if not labeled_words:
         return labeled_words
 
@@ -592,7 +644,17 @@ def _merge_short_turns(labeled_words: list, min_turn_duration: float = 1.5,
         while i < len(turns):
             spk, wds = turns[i]
             duration = (wds[-1]["end"] - wds[0]["start"]) if wds else 0
-            is_short = (duration < min_turn_duration) and (len(wds) < min_word_count)
+            # Script-aware short-turn test. For space-delimited text a "turn" is
+            # short when it is both brief AND has few words. For Thai/CJK,
+            # faster-whisper words are single characters, so word count is a poor
+            # proxy; use a character-count gate instead (OR'd with duration) so
+            # residual micro-turns from per-character timing still coalesce.
+            turn_text = "".join(w.get("text", "") for w in wds)
+            if _is_cjk_or_thai(turn_text):
+                char_count = sum(len(w.get("text", "").strip()) for w in wds)
+                is_short = (char_count < min_cjk_turn_chars) or (duration < min_turn_duration)
+            else:
+                is_short = (duration < min_turn_duration) and (len(wds) < min_word_count)
             if is_short and len(turns) > 1:
                 if merged and merged[-1][0] == spk:
                     merged[-1] = (spk, merged[-1][1] + wds)
@@ -860,6 +922,7 @@ async def process_job(job_id: str, audio_path: str, language: str, num_speakers:
             min_turn_duration=adv.get("min_turn_duration", 1.5),
             min_word_count=adv.get("min_word_count", 4),
             max_speakers=num_speakers,
+            min_cjk_turn_chars=adv.get("min_cjk_turn_chars", 6),
         )
         labeled_words = absorb_backchannels(labeled_words, max_words=2, max_duration=1.0)
 
@@ -1010,7 +1073,7 @@ async def start_transcription(
     (OUTPUT_DIR / group).mkdir(parents=True, exist_ok=True)
 
     preset_map = {
-        "interview": {"min_turn": 1.5, "min_silence": 0.5, "min_cluster": 75, "min_words": 4},
+        "interview": {"min_turn": 1.2, "min_silence": 0.7, "min_cluster": 35, "min_words": 3},
         "focus_group": {"min_turn": 0.8, "min_silence": 0.3, "min_cluster": 50, "min_words": 3},
         "panel": {"min_turn": 0.5, "min_silence": 0.2, "min_cluster": 30, "min_words": 2},
         "monologue": {"min_turn": 2.0, "min_silence": 1.5, "min_cluster": 120, "min_words": 6},
