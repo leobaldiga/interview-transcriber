@@ -35,8 +35,10 @@ def main():
     audio_path = args["audio_path"]
     hf_token = args["hf_token"]
     num_speakers = args.get("num_speakers")
-    min_silence = float(args.get("min_silence", 0.5))
-    min_cluster_size = int(args.get("min_cluster_size", 75))
+    # Defaults harmonized with app.py (/api/transcribe form defaults) so a direct
+    # invocation of this worker matches the webapp's behavior.
+    min_silence = float(args.get("min_silence", 0.7))
+    min_cluster_size = int(args.get("min_cluster_size", 35))
     seg_onset = float(args.get("seg_onset", 0.6))
     seg_offset = float(args.get("seg_offset", 0.4))
 
