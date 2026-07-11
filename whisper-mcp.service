@@ -24,15 +24,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Path to the interview-transcriber checkout (contains app.py, .venv, uploads/, outputs/)
-WorkingDirectory=%h/interview-transcriber
+WorkingDirectory=%h/Documents/github/interview-transcriber
 # Use the app's own venv; install deps with:
 #   ./.venv/bin/pip install -r requirements-mcp.txt
-ExecStart=%h/interview-transcriber/.venv/bin/python %h/interview-transcriber/mcp_proxy.py
+ExecStart=%h/Documents/github/interview-transcriber/.venv/bin/python %h/Documents/github/interview-transcriber/mcp_proxy.py
 # Point at the running transcriber app + its uploads/outputs dirs
 Environment=TRANSCRIBER_URL=http://localhost:8765
-Environment=TRANSCRIBER_DIR=%h/interview-transcriber
-Environment=UPLOADS_DIR=%h/interview-transcriber/uploads
-Environment=OUTPUTS_DIR=%h/interview-transcriber/outputs
+Environment=TRANSCRIBER_DIR=%h/Documents/github/interview-transcriber
+Environment=UPLOADS_DIR=%h/Documents/github/interview-transcriber/uploads
+Environment=OUTPUTS_DIR=%h/Documents/github/interview-transcriber/outputs
 Environment=HOST=0.0.0.0
 Environment=PORT=8002
 Environment=VRAM_WARN_MB=2048

@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # --- Configuration (env-overridable) -----------------------------------------
 TRANSCRIBER_URL = os.getenv("TRANSCRIBER_URL", "http://localhost:8765").rstrip("/")
@@ -45,7 +47,27 @@ MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "60000"))
 
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".mp4", ".webm", ".aac"}
 
-mcp = FastMCP("interview-transcriber")
+# Host header values the Streamable HTTP transport will accept (DNS-rebinding
+# protection rejects anything not listed; no "*" wildcard, only exact matches
+# and "host:*" port patterns). Defaults cover the Docker service name used by
+# open-webui, host.docker.internal, localhost, and the storm1 tailscale IP.
+# Override via comma-separated MCP_ALLOWED_HOSTS.
+_DEFAULT_ALLOWED_HOSTS = [
+    "whisper-mcp:*",
+    "host.docker.internal:*",
+    "localhost:*",
+    "127.0.0.1:*",
+    "[::1]:*",
+    "100.98.84.83:*",
+]
+_allowed_hosts = (
+    [h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    or _DEFAULT_ALLOWED_HOSTS
+)
+mcp = FastMCP(
+    "interview-transcriber",
+    transport_security=TransportSecuritySettings(allowed_hosts=_allowed_hosts),
+)
 
 
 # --- Whisper model catalogue (static; VRAM figures are faster-whisper int8 --- 
@@ -152,29 +174,52 @@ def _load_jobs_index() -> list[dict]:
     return []
 
 
-def _transcribed_filenames() -> set[str]:
-    """Original filenames that have at least one completed job."""
-    done: set[str] = set()
+# 8-hex-char hash prefix the transcriber app prepends to every upload (can
+# stack, e.g. "e36f1af0_09ae599a_<orig>"). Strip ALL leading such prefixes so
+# sibling copies and web-UI-submitted (un-prefixed) jobs match the same base.
+# Only strip prefixes that contain a hex letter a-f — pure-digit 8-char prefixes
+# are dates (e.g. 20260416_), not hashes.
+_HEX_PREFIX_RE = re.compile(r"^([0-9a-f]{8})_")
+
+
+def _normalize_name(name: str) -> str:
+    name = os.path.basename(name)
+    while True:
+        m = _HEX_PREFIX_RE.match(name)
+        if not m or not any(c in "abcdef" for c in m.group(1)):
+            break
+        name = name[m.end():]
+    return name
+
+
+def _completed_jobs_by_base() -> dict[str, list[str]]:
+    """Map normalized base filename -> job_ids with status == 'complete'."""
+    out: dict[str, list[str]] = {}
     for j in _load_jobs_index():
         if j.get("status") == "complete" and j.get("filename"):
-            done.add(j["filename"])
-    return done
+            base = _normalize_name(j["filename"])
+            jid = j.get("id") or j.get("job_id")
+            if jid:
+                out.setdefault(base, []).append(jid)
+    return out
 
 
 def _list_uploads() -> list[dict]:
     if not UPLOADS_DIR.exists():
         return []
-    done = _transcribed_filenames()
+    done = _completed_jobs_by_base()  # base filename -> [job_id, ...]
     out = []
     for p in sorted(UPLOADS_DIR.iterdir()):
         if not p.is_file() or p.suffix.lower() not in AUDIO_EXTS:
             continue
+        job_ids = done.get(_normalize_name(p.name), [])
         out.append({
             "name": p.name,
             "path": str(p),
             "size_mb": round(p.stat().st_size / 1024 / 1024, 1),
             "duration_s": _probe_duration(p),
-            "transcribed": p.name in done,
+            "transcribed": bool(job_ids),
+            "job_ids": job_ids,
         })
     return out
 
@@ -244,7 +289,9 @@ def list_audio_files() -> dict:
         "count": len(files),
         "files": files,
         "note": "Pass a 'path' value to transcribe_audio(). Files with "
-                "'transcribed': true already have a completed transcript.",
+                "'transcribed': true already have a completed transcript — use "
+                "get_job(job_id) with one of that file's 'job_ids' to retrieve it "
+                "instead of re-transcribing.",
     }
 
 
