@@ -1255,6 +1255,20 @@ async def create_group(name: str = Form(...)):
     return _get_all_groups()
 
 
+@app.post("/api/jobs/{job_id}/rename")
+async def rename_job(job_id: str, filename: str = Form(...)):
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    filename = filename.strip()
+    if not filename:
+        raise HTTPException(400, "Filename cannot be empty")
+    job = jobs[job_id]
+    job["filename"] = filename
+    _save_job_json(job_id)
+    _save_jobs_index()
+    return {"ok": True, "filename": filename}
+
+
 @app.post("/api/jobs/{job_id}/move")
 async def move_job(job_id: str, group: str = Form(...)):
     if job_id not in jobs:
@@ -1330,6 +1344,103 @@ async def save_transcript(job_id: str, content: str = Form(...)):
         raise HTTPException(400, "No transcript file for this job")
     txt_path.write_text(content, encoding="utf-8")
     return {"ok": True}
+
+
+def _load_words_payload(job_id: str) -> tuple[Path, dict]:
+    """Load the {job_id}_words.json payload for a job. Raises HTTPException on failure."""
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    words_path = _resolve_job_path(jobs[job_id].get("files", {}).get("json"))
+    if not words_path or not words_path.exists():
+        raise HTTPException(404, "Word data not found")
+    try:
+        payload = json.loads(words_path.read_text(encoding="utf-8"))
+    except Exception:
+        raise HTTPException(500, "Word data is corrupt")
+    if not isinstance(payload.get("words"), list):
+        raise HTTPException(500, "Word data missing 'words' list")
+    return words_path, payload
+
+
+def _rewrite_job_outputs(job_id: str, words_path: Path, payload: dict):
+    """Persist an updated words payload back to disk and regenerate .txt/.srt from it.
+
+    This is the single source of truth rewrite used by speaker rename/merge so that
+    every future .txt/.srt export reflects the edited speaker labels permanently.
+    """
+    words = payload["words"]
+    speakers = sorted({w.get("speaker") for w in words if w.get("speaker")})
+    payload["speakers"] = speakers
+    words_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    job = jobs[job_id]
+    files = job.get("files", {})
+
+    txt_path = _resolve_job_path(files.get("txt"))
+    if txt_path:
+        txt_path.write_text(build_diarized_transcript(words), encoding="utf-8")
+
+    srt_path = _resolve_job_path(files.get("srt"))
+    if srt_path:
+        srt_path.write_text(build_srt(words), encoding="utf-8")
+
+    job["num_speakers"] = len(speakers)
+    _save_job_json(job_id)
+    _save_jobs_index()
+
+
+@app.post("/api/jobs/{job_id}/speakers/rename")
+async def rename_speaker(job_id: str, old_name: str = Form(...), new_name: str = Form(...)):
+    old_name = old_name.strip()
+    new_name = new_name.strip()
+    if not old_name or not new_name:
+        raise HTTPException(400, "Speaker names cannot be empty")
+
+    words_path, payload = _load_words_payload(job_id)
+    words = payload["words"]
+
+    if old_name == new_name:
+        return {"ok": True, "speakers": sorted({w.get("speaker") for w in words if w.get("speaker")})}
+
+    matched = False
+    for w in words:
+        if w.get("speaker") == old_name:
+            w["speaker"] = new_name
+            matched = True
+    if not matched:
+        raise HTTPException(404, f"Speaker '{old_name}' not found in this job")
+
+    _rewrite_job_outputs(job_id, words_path, payload)
+    return {"ok": True, "speakers": payload["speakers"]}
+
+
+@app.post("/api/jobs/{job_id}/speakers/merge")
+async def merge_speakers(job_id: str, speakers: str = Form(...), target_name: str = Form(...)):
+    try:
+        speaker_list = json.loads(speakers)
+    except Exception:
+        raise HTTPException(400, "'speakers' must be a JSON array of speaker names")
+    if not isinstance(speaker_list, list) or len(speaker_list) < 2:
+        raise HTTPException(400, "Provide at least 2 speaker names to merge")
+    speaker_list = [s.strip() for s in speaker_list if isinstance(s, str) and s.strip()]
+    target_name = target_name.strip()
+    if not target_name:
+        raise HTTPException(400, "Target speaker name cannot be empty")
+
+    words_path, payload = _load_words_payload(job_id)
+    words = payload["words"]
+
+    source_set = set(speaker_list)
+    matched = False
+    for w in words:
+        if w.get("speaker") in source_set:
+            w["speaker"] = target_name
+            matched = True
+    if not matched:
+        raise HTTPException(404, "None of the given speakers were found in this job")
+
+    _rewrite_job_outputs(job_id, words_path, payload)
+    return {"ok": True, "speakers": payload["speakers"]}
 
 
 @app.get("/api/dictionary")

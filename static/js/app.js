@@ -791,7 +791,7 @@
     return `<div class="job-card ${cardClass}" data-job-id-card="${job.id}">`
       + '<div class="job-card-header">'
       + '<div class="job-card-info">'
-      + '<div class="job-card-filename">' + escapeHtml(job.filename || 'Unknown file') + '</div>'
+      + '<div class="job-card-filename" data-action="rename" data-job-id="' + job.id + '" title="Click to rename">' + escapeHtml(job.filename || 'Unknown file') + '</div>'
       + '<div class="job-card-time">' + escapeHtml(formatTimestamp(job.created_at)) + '</div>'
       + '</div>'
       + '<div style="display:flex;align-items:center;gap:8px;">'
@@ -819,7 +819,46 @@
       await cancelJob(jobId);
     } else if (action === 'delete') {
       await deleteJob(jobId);
+    } else if (action === 'rename') {
+      startRenameJob(btn, jobId);
     }
+  }
+
+  function startRenameJob(el, jobId) {
+    const job = jobs.find(j => j.id === jobId);
+    if (!job) return;
+    const current = job.filename || '';
+    const input = document.createElement('input');
+    input.className = 'job-card-filename-input';
+    input.value = current;
+    el.replaceWith(input);
+    input.focus();
+    input.select();
+
+    let done = false;
+    async function commit() {
+      if (done) return;
+      done = true;
+      const newName = input.value.trim();
+      if (newName && newName !== current) {
+        try {
+          const fd = new FormData();
+          fd.append('filename', newName);
+          const res = await fetch(`/api/jobs/${jobId}/rename`, { method: 'POST', body: fd });
+          if (!res.ok) throw new Error('Rename failed');
+          job.filename = newName;
+        } catch (err) {
+          alert('Failed to rename job: ' + err.message);
+        }
+      }
+      renderJobs();
+    }
+
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+      if (e.key === 'Escape') { done = true; renderJobs(); }
+    });
   }
 
   async function cancelJob(jobId) {

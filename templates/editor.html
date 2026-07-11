@@ -15,7 +15,8 @@
 <!-- ── Top bar ───────────────────────────────────────────────── -->
 <header class="ed-header">
   <a href="/" class="ed-back" title="Back to jobs">&#8592; Jobs</a>
-  <span class="ed-title" id="edTitle">Loading&hellip;</span>
+  <span class="ed-title" id="edTitle" title="Click to rename">Loading&hellip;</span>
+  <input class="ed-title-input" id="edTitleInput" hidden>
   <div class="ed-header-actions">
     <button class="ed-btn ed-btn--ghost" id="btnFindReplace" title="Find &amp; Replace (Ctrl+H)">
       &#128269; Find &amp; Replace
@@ -74,6 +75,11 @@
         confidence
       </div>
     </div>
+    <div class="ed-speaker-toolbar" id="edSpeakerToolbar" hidden>
+      <span class="ed-speaker-toolbar-label">Speakers:</span>
+      <div class="ed-speaker-chips" id="edSpeakerChips"></div>
+      <button class="ed-btn ed-btn--sm" id="btnMergeSpeakers" disabled>Merge selected</button>
+    </div>
     <div class="ed-segments" id="edSegments">
       <div class="ed-loading">Loading transcript&hellip;</div>
     </div>
@@ -123,6 +129,7 @@ let dictScope     = 'group';
 let dirty         = false;  // unsaved transcript changes
 let findMatches   = [];
 let findIndex     = -1;
+let selectedSpeakers = new Set();  // speaker names checked for merge
 
 // ── DOM refs ─────────────────────────────────────────────────────────────
 const audioEl       = document.getElementById('audioEl');
@@ -133,6 +140,10 @@ const totalTimeEl   = document.getElementById('totalTime');
 const speedSelect   = document.getElementById('speedSelect');
 const edSegments    = document.getElementById('edSegments');
 const edTitle       = document.getElementById('edTitle');
+const edTitleInput  = document.getElementById('edTitleInput');
+const edSpeakerToolbar = document.getElementById('edSpeakerToolbar');
+const edSpeakerChips   = document.getElementById('edSpeakerChips');
+const btnMergeSpeakers = document.getElementById('btnMergeSpeakers');
 const btnSave       = document.getElementById('btnSave');
 const btnFindReplace = document.getElementById('btnFindReplace');
 const findBar       = document.getElementById('findBar');
@@ -167,6 +178,7 @@ function joinWords(words) {
 async function init() {
   edTitle.textContent = JOB.filename || JOB_ID;
   document.title = `Editor — ${JOB.filename || JOB_ID}`;
+  initTitleRename();
 
   // Load audio
   audioEl.src = `/api/audio/${JOB_ID}`;
@@ -179,12 +191,48 @@ async function init() {
     const data = await res.json();
     buildSegments(data);
     renderSegments();
+    renderSpeakerToolbar();
   } catch (e) {
     edSegments.innerHTML = '<div class="ed-error">Word data not available. Re-transcribe the job to enable the editor.</div>';
   }
 
   // Load dictionary
   await loadDictionary();
+}
+
+// ── Job title rename ───────────────────────────────────────────────────────
+function initTitleRename() {
+  edTitle.addEventListener('click', () => {
+    edTitleInput.value = JOB.filename || JOB_ID;
+    edTitle.hidden = true;
+    edTitleInput.hidden = false;
+    edTitleInput.focus();
+    edTitleInput.select();
+  });
+
+  async function commitRename() {
+    const newName = edTitleInput.value.trim();
+    edTitleInput.hidden = true;
+    edTitle.hidden = false;
+    if (!newName || newName === JOB.filename) return;
+    try {
+      const fd = new FormData();
+      fd.append('filename', newName);
+      const res = await fetch(`/api/jobs/${JOB_ID}/rename`, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error('Rename failed');
+      JOB.filename = newName;
+      edTitle.textContent = newName;
+      document.title = `Editor — ${newName}`;
+    } catch (e) {
+      alert('Failed to rename job: ' + e.message);
+    }
+  }
+
+  edTitleInput.addEventListener('blur', commitRename);
+  edTitleInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); edTitleInput.blur(); }
+    if (e.key === 'Escape') { edTitleInput.value = JOB.filename || JOB_ID; edTitleInput.blur(); }
+  });
 }
 
 // ── Segment / word building ───────────────────────────────────────────────
@@ -242,6 +290,8 @@ function renderSegments() {
     const spkEl = document.createElement('span');
     spkEl.className = 'ed-seg-speaker';
     spkEl.textContent = seg.speaker;
+    spkEl.title = 'Click to rename this speaker (renames everywhere)';
+    spkEl.addEventListener('click', () => startSpeakerRename(spkEl, seg.speaker));
     row.appendChild(spkEl);
 
     // Words container — dual mode: view (spans w/ confidence) / edit (contenteditable)
@@ -253,20 +303,46 @@ function renderSegments() {
       wordsEl.innerHTML = '';
       wordsEl.contentEditable = 'false';
       wordsEl.classList.remove('ed-seg-words--editing');
+
+      // Group adjacent Thai/CJK tokens (which can be isolated combining marks
+      // with no base glyph of their own, e.g. tone marks / vowel signs) into a
+      // single contiguous DOM text node per cluster. Rendering them as separate
+      // <span> elements causes the browser to substitute a dotted-circle
+      // placeholder (U+25CC) for a combining mark with no preceding base
+      // character in the same text node — this matches exactly what
+      // disappears in enterEditMode(), which joins everything into one string.
+      const clusters = [];
+      let cur = null;
       seg.words.forEach((w, wi) => {
-        const span = document.createElement('span');
-        span.className = `ed-word ${confClass(w.probability)}`;
-        span.dataset.segIdx  = si;
-        span.dataset.wordIdx = wi;
-        span.dataset.start   = w.start;
-        span.dataset.end     = w.end;
-        span.title = `${Math.round(w.probability * 100)}% confidence · ${formatTime(w.start)}`;
-        span.textContent = w.text;
-        // Single-click: seek audio
-        span.addEventListener('click', () => seekTo(w.start));
-        wordsEl.appendChild(span);
-        if (!isCJKorThai(w.text)) wordsEl.appendChild(document.createTextNode(' '));
+        const cjk = isCJKorThai(w.text);
+        const gap = cur ? (w.start - cur.end) : 0;
+        if (cur && cjk && cur.cjk && gap <= 0.15) {
+          cur.words.push(w);
+          cur.wis.push(wi);
+          cur.end = w.end;
+        } else {
+          cur = { words: [w], wis: [wi], cjk, start: w.start, end: w.end };
+          clusters.push(cur);
+        }
       });
+
+      clusters.forEach(cluster => {
+        const span = document.createElement('span');
+        const avgProb = cluster.words.reduce((s, w) => s + w.probability, 0) / cluster.words.length;
+        span.className = `ed-word ${confClass(avgProb)}`;
+        span.dataset.segIdx     = si;
+        span.dataset.wordIdx    = cluster.wis[0];
+        span.dataset.wordIdxEnd = cluster.wis[cluster.wis.length - 1];
+        span.dataset.start      = cluster.start;
+        span.dataset.end        = cluster.end;
+        span.title = `${Math.round(avgProb * 100)}% confidence · ${formatTime(cluster.start)}`;
+        span.textContent = cluster.words.map(w => w.text).join('');
+        // Single-click: seek audio to the start of this cluster
+        span.addEventListener('click', () => seekTo(cluster.start));
+        wordsEl.appendChild(span);
+        if (!cluster.cjk) wordsEl.appendChild(document.createTextNode(' '));
+      });
+
       // Click the words area (not on a span) enters edit mode
       wordsEl.addEventListener('click', (e) => {
         if (e.target === wordsEl) enterEditMode();
@@ -348,6 +424,114 @@ function renderSegments() {
   });
 }
 
+// ── Speaker rename / merge ─────────────────────────────────────────────────
+function distinctSpeakers() {
+  return [...new Set(segments.map(s => s.speaker))].sort();
+}
+
+async function applySpeakerNameChange(oldName, newName) {
+  // Update local state immediately so UI feels instant, then persist to server.
+  segments.forEach(seg => { if (seg.speaker === oldName) seg.speaker = newName; });
+  wordData.forEach(w => { if (w.speaker === oldName) w.speaker = newName; });
+  if (selectedSpeakers.has(oldName)) { selectedSpeakers.delete(oldName); selectedSpeakers.add(newName); }
+
+  const fd = new FormData();
+  fd.append('old_name', oldName);
+  fd.append('new_name', newName);
+  const res = await fetch(`/api/jobs/${JOB_ID}/speakers/rename`, { method: 'POST', body: fd });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(errText || 'Rename failed');
+  }
+}
+
+function startSpeakerRename(spkEl, currentName) {
+  const input = document.createElement('input');
+  input.className = 'ed-seg-speaker-input';
+  input.value = currentName;
+  spkEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  async function commit() {
+    if (done) return;
+    done = true;
+    const newName = input.value.trim();
+    if (newName && newName !== currentName) {
+      try {
+        await applySpeakerNameChange(currentName, newName);
+      } catch (e) {
+        alert('Failed to rename speaker: ' + e.message);
+      }
+    }
+    renderSegments();
+    renderSpeakerToolbar();
+  }
+
+  input.addEventListener('blur', commit);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+    if (e.key === 'Escape') { done = true; renderSegments(); renderSpeakerToolbar(); }
+  });
+}
+
+function renderSpeakerToolbar() {
+  const names = distinctSpeakers();
+  if (names.length < 2) {
+    edSpeakerToolbar.hidden = true;
+    return;
+  }
+  edSpeakerToolbar.hidden = false;
+  edSpeakerChips.innerHTML = '';
+  names.forEach(name => {
+    const chip = document.createElement('label');
+    chip.className = 'ed-speaker-chip';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = selectedSpeakers.has(name);
+    cb.addEventListener('change', () => {
+      if (cb.checked) selectedSpeakers.add(name); else selectedSpeakers.delete(name);
+      btnMergeSpeakers.disabled = selectedSpeakers.size < 2;
+    });
+    chip.appendChild(cb);
+    chip.appendChild(document.createTextNode(name));
+    edSpeakerChips.appendChild(chip);
+  });
+  btnMergeSpeakers.disabled = selectedSpeakers.size < 2;
+}
+
+btnMergeSpeakers.addEventListener('click', async () => {
+  const toMerge = [...selectedSpeakers];
+  if (toMerge.length < 2) return;
+  const targetName = prompt(`Merge ${toMerge.length} speakers (${toMerge.join(', ')}) into what name?`, toMerge[0]);
+  if (!targetName || !targetName.trim()) return;
+  const finalName = targetName.trim();
+
+  btnMergeSpeakers.disabled = true;
+  btnMergeSpeakers.textContent = 'Merging…';
+  try {
+    const fd = new FormData();
+    fd.append('speakers', JSON.stringify(toMerge));
+    fd.append('target_name', finalName);
+    const res = await fetch(`/api/jobs/${JOB_ID}/speakers/merge`, { method: 'POST', body: fd });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(errText || 'Merge failed');
+    }
+    const mergeSet = new Set(toMerge);
+    segments.forEach(seg => { if (mergeSet.has(seg.speaker)) seg.speaker = finalName; });
+    wordData.forEach(w => { if (mergeSet.has(w.speaker)) w.speaker = finalName; });
+    selectedSpeakers = new Set();
+    renderSegments();
+    renderSpeakerToolbar();
+  } catch (e) {
+    alert('Failed to merge speakers: ' + e.message);
+  } finally {
+    btnMergeSpeakers.textContent = 'Merge selected';
+  }
+});
+
 // ── Inline word editing ───────────────────────────────────────────────────
 function startEditing(span, si, wi) {
   span.contentEditable = 'true';
@@ -424,6 +608,19 @@ function seekTo(t) {
   if (audioEl.paused) audioEl.play();
 }
 
+// Find the rendered <span> that covers a given word index within a segment.
+// Spans may represent a cluster of multiple Thai/CJK tokens (see renderViewMode),
+// so match on the [wordIdx, wordIdxEnd] range rather than an exact index.
+function findWordSpan(si, wi) {
+  const candidates = edSegments.querySelectorAll(`[data-seg-idx="${si}"][data-word-idx]`);
+  for (const el of candidates) {
+    const lo = parseInt(el.dataset.wordIdx, 10);
+    const hi = el.dataset.wordIdxEnd !== undefined ? parseInt(el.dataset.wordIdxEnd, 10) : lo;
+    if (wi >= lo && wi <= hi) return el;
+  }
+  return null;
+}
+
 function highlightCurrentWord(t) {
   // Binary search for current word
   let lo = 0, hi = wordData.length - 1, found = null;
@@ -437,9 +634,7 @@ function highlightCurrentWord(t) {
 
   if (found !== null) {
     const w = wordData[found];
-    const sel = edSegments.querySelector(
-      `[data-seg-idx="${w.seg_idx}"][data-word-idx="${w.word_idx}"]`
-    );
+    const sel = findWordSpan(w.seg_idx, w.word_idx);
     if (sel && sel !== activeWordEl) {
       if (activeWordEl) activeWordEl.classList.remove('ed-word--active');
       sel.classList.add('ed-word--active');
@@ -508,13 +703,13 @@ document.getElementById('btnFindPrev').addEventListener('click', () => moveFindI
 document.getElementById('btnReplaceOne').addEventListener('click', () => {
   if (findIndex < 0 || findMatches.length === 0) return;
   const m = findMatches[findIndex];
-  const span = edSegments.querySelector(`[data-seg-idx="${m.si}"][data-word-idx="${m.wi}"]`);
+  const span = findWordSpan(m.si, m.wi);
   if (span) {
-    span.textContent = replaceInput.value;
     segments[m.si].words[m.wi].text = replaceInput.value;
     const wd = wordData.find(w => w.seg_idx === m.si && w.word_idx === m.wi);
     if (wd) wd.text = replaceInput.value;
     markDirty();
+    renderSegments();
     runFind();
   }
 });
@@ -554,7 +749,7 @@ function runFind() {
 
 function highlightFindMatches() {
   findMatches.forEach(m => {
-    const span = edSegments.querySelector(`[data-seg-idx="${m.si}"][data-word-idx="${m.wi}"]`);
+    const span = findWordSpan(m.si, m.wi);
     if (span) span.classList.add('ed-word--found');
   });
 }
@@ -570,12 +765,12 @@ function moveFindIndex(dir) {
   // Remove current highlight
   if (findIndex >= 0) {
     const m = findMatches[findIndex];
-    const span = edSegments.querySelector(`[data-seg-idx="${m.si}"][data-word-idx="${m.wi}"]`);
+    const span = findWordSpan(m.si, m.wi);
     if (span) span.classList.remove('ed-word--find-current');
   }
   findIndex = (findIndex + dir + findMatches.length) % findMatches.length;
   const m = findMatches[findIndex];
-  const span = edSegments.querySelector(`[data-seg-idx="${m.si}"][data-word-idx="${m.wi}"]`);
+  const span = findWordSpan(m.si, m.wi);
   if (span) {
     span.classList.add('ed-word--find-current');
     span.scrollIntoView({ block: 'center', behavior: 'smooth' });

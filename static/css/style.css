@@ -504,6 +504,27 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+}
+.job-card-filename:hover {
+  background: var(--border-light);
+}
+
+.job-card-filename-input {
+  font-size: 0.9rem;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--accent-blue);
+  border-radius: 4px;
+  padding: 1px 4px;
+  width: 100%;
+  min-width: 0;
+  outline: none;
 }
 
 .job-card-time {
