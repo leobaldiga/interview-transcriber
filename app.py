@@ -44,6 +44,9 @@ DEFAULT_GROUP = "Ungrouped"
 IS_WINDOWS = os.name == "nt"
 
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3-turbo").strip() or "large-v3-turbo"
+# Path to the CT2-converted Khmer fine-tune (seanghay/whisper-small-khmer-v2).
+# Passed straight to faster-whisper's WhisperModel(), which accepts a local dir.
+KHMER_MODEL_PATH = os.environ.get("KHMER_MODEL_PATH", "/opt/models/whisper-khmer-v2-ct2").strip() or "/opt/models/whisper-khmer-v2-ct2"
 
 
 def _has_gpu() -> bool:
@@ -596,7 +599,12 @@ def assign_speakers_to_words(segments: list, diarization_turns: list) -> list:
 def _is_cjk_or_thai(text: str) -> bool:
     for ch in text:
         cp = ord(ch)
-        if 0x0E00 <= cp <= 0x0E7F or 0x4E00 <= cp <= 0x9FFF or 0x3000 <= cp <= 0x303F:
+        if (
+            0x0E00 <= cp <= 0x0E7F  # Thai
+            or 0x1780 <= cp <= 0x17FF  # Khmer
+            or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+            or 0x3000 <= cp <= 0x303F  # CJK symbols & punctuation
+        ):
             return True
     return False
 
@@ -882,14 +890,21 @@ async def process_job(job_id: str, audio_path: str, language: str, num_speakers:
 
         loop = asyncio.get_event_loop()
         _model = job.get("whisper_model") or WHISPER_MODEL_SIZE
-        _th_models = {
-            "Vinxscribe/biodatlab-whisper-th-large-v3-faster",
-            "nectec/Pathumma-whisper-th-large-v3",
-            "nectec/Pathumma-whisper-th-medium",
+        # Models fine-tuned for a single language: force that language when the
+        # user left detection on "auto". Extend this map for new monolingual models.
+        _forced_lang_models = {
+            "Vinxscribe/biodatlab-whisper-th-large-v3-faster": "th",
+            "nectec/Pathumma-whisper-th-large-v3": "th",
+            "nectec/Pathumma-whisper-th-medium": "th",
+            KHMER_MODEL_PATH: "km",
         }
         _lang = None if language in ("auto", "", None) else language
-        if _model in _th_models and _lang is None:
-            _lang = "th"
+        if _lang is None:
+            if _model in _forced_lang_models:
+                _lang = _forced_lang_models[_model]
+            elif "khmer" in _model.lower() or _model == KHMER_MODEL_PATH:
+                # Fallback: any Khmer model path (e.g. a custom KHMER_MODEL_PATH)
+                _lang = "km"
 
         _secondary = job.get("secondary_language", "").strip()
         if _secondary and _secondary != _lang:

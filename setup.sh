@@ -68,6 +68,30 @@ fi
   --quiet
 echo "[OK] .venv created"
 
+# ── 4b. Convert Khmer fine-tune to CT2 (faster-whisper) format ──────
+# seanghay/whisper-small-khmer-v2 is a native HF transformers Whisper model;
+# faster-whisper needs a CTranslate2-converted dir. int8 matches the CUDA path
+# in whisper_worker.py. Set KHMER_MODEL_PATH in .env to override the location.
+KHMER_MODEL_PATH="${KHMER_MODEL_PATH:-/opt/models/whisper-khmer-v2-ct2}"
+if [ -f "$KHMER_MODEL_PATH/model.bin" ]; then
+  echo "[SKIP] Khmer CT2 model already present at $KHMER_MODEL_PATH"
+else
+  echo ""
+  echo "Converting seanghay/whisper-small-khmer-v2 to CT2 (int8)..."
+  .venv/bin/pip install ctranslate2 transformers --quiet
+  if mkdir -p "$KHMER_MODEL_PATH" 2>/dev/null && [ -w "$KHMER_MODEL_PATH" ]; then
+    .venv/bin/ct2-transformers-converter \
+      --model seanghay/whisper-small-khmer-v2 \
+      --output_dir "$KHMER_MODEL_PATH" \
+      --quantization int8 \
+      --force \
+      && echo "[OK] Khmer model converted to $KHMER_MODEL_PATH" \
+      || echo "[WARN] Khmer model conversion failed — Khmer option will be unavailable until fixed."
+  else
+    echo "[WARN] Cannot write to $KHMER_MODEL_PATH (try sudo mkdir -p \"$KHMER_MODEL_PATH\" && chown \$USER). Skipping Khmer conversion."
+  fi
+fi
+
 # ── 5. Create .venv-pyannote (PyTorch + pyannote) ───────────────────
 echo ""
 echo "Creating .venv-pyannote (PyTorch + pyannote.audio)..."
@@ -123,6 +147,7 @@ if [ ! -f ".env" ]; then
   cat > .env <<'EOF'
 HOST=0.0.0.0
 PORT=8765
+KHMER_MODEL_PATH=/opt/models/whisper-khmer-v2-ct2
 EOF
   echo "[OK] .env created"
 else
