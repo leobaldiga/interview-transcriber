@@ -63,6 +63,7 @@ dist/
 
 outputs/
 uploads/
+models/
 
 # =========================
 # LOGS / LOCAL DB

@@ -1,0 +1,3 @@
+# Test-only dependencies. Install into the app .venv:
+#   .venv/bin/pip install -r requirements-dev.txt
+pytest>=8.0
