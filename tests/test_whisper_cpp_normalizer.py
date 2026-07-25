@@ -6,7 +6,7 @@ from engines.whisper_cpp_engine import WhisperCppHttpEngine, normalize_language
 
 @pytest.fixture
 def engine():
-    return WhisperCppHttpEngine(base_url="http://127.0.0.1:8081")
+    return WhisperCppHttpEngine(base_url="http://127.0.0.1:8089")
 
 
 def test_verbose_json_maps_to_canonical_schema(engine, load_fixture):

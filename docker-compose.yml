@@ -9,7 +9,7 @@ services:
     container_name: whisper-cpp
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:${WHISPER_CPP_HOST_PORT:-8089}:8081"
     volumes:
       - "${WHISPER_MODELS_DIR:-./models}:/models:ro"
     environment:

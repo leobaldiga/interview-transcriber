@@ -40,7 +40,7 @@ from .timestamps import extract_span, parse_timestamp
 
 NAME = "whisper_cpp"
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8081"
+DEFAULT_BASE_URL = "http://127.0.0.1:8089"
 DEFAULT_CONNECT_TIMEOUT = 5.0
 DEFAULT_READ_TIMEOUT = 3600.0
 DEFAULT_RETRIES = 3

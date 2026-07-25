@@ -52,7 +52,7 @@ class FakeSession:
 
 
 def make_engine(session, **kwargs):
-    kwargs.setdefault("base_url", "http://127.0.0.1:8081")
+    kwargs.setdefault("base_url", "http://127.0.0.1:8089")
     kwargs.setdefault("retries", 3)
     return WhisperCppHttpEngine(session=session, **kwargs)
 
@@ -191,7 +191,7 @@ def test_inference_posts_multipart_file_field(audio, load_fixture):
     make_engine(session).transcribe(audio, TranscribeOptions(language="en"))
 
     url, kwargs = session.post_calls[0]
-    assert url == "http://127.0.0.1:8081/inference"
+    assert url == "http://127.0.0.1:8089/inference"
     assert "file" in kwargs["files"]
     assert kwargs["data"]["response_format"] == "verbose_json"
     assert kwargs["timeout"][1] == 3600.0

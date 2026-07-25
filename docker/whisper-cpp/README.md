@@ -1,7 +1,11 @@
 # whisper.cpp CUDA server
 
 Builds `whisper-server` from source with `GGML_CUDA=ON` and serves it on
-`127.0.0.1:8081`. No model is baked into the image.
+`127.0.0.1:8089`. No model is baked into the image.
+
+The container listens on 8081 internally; only the published host port moves.
+Set `WHISPER_CPP_HOST_PORT` to publish somewhere else, and keep
+`WHISPER_CPP_URL` in `.env` pointed at whatever you pick.
 
 ## 1. Fetch a ggml model yourself
 
@@ -42,7 +46,7 @@ Without compose:
 ```bash
 docker build --build-arg CUDA_ARCH=86 -t whisper-cpp:cuda docker/whisper-cpp
 docker run -d --name whisper-cpp --gpus all \
-  -p 127.0.0.1:8081:8081 \
+  -p 127.0.0.1:8089:8081 \
   -v ~/models/whisper:/models:ro \
   -e WHISPER_MODEL=/models/ggml-large-v3-turbo.bin \
   whisper-cpp:cuda
@@ -51,7 +55,7 @@ docker run -d --name whisper-cpp --gpus all \
 ## 3. Verify
 
 ```bash
-curl -s http://127.0.0.1:8081/health          # {"status":"ok"}
+curl -s http://127.0.0.1:8089/health          # {"status":"ok"}
 nvidia-smi                                     # whisper-server should hold VRAM
 ```
 
