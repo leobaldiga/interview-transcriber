@@ -15,7 +15,6 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -28,6 +27,11 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+from engines import EngineHooks, TranscribeOptions, get_engine
+from engines.process import build_worker_env as _build_worker_env
+from engines.process import spawn_worker as _spawn_worker
+from engines.process import venv_python_path as _venv_python_path
 
 warnings.filterwarnings("ignore", message=".*MPEG_LAYER_III.*")
 
@@ -88,47 +92,6 @@ def _load_hf_token() -> str:
 
 
 HF_TOKEN = _load_hf_token()
-
-
-def _venv_python_path(venv_dir: Path) -> Path:
-    return venv_dir / "Scripts" / "python.exe" if IS_WINDOWS else venv_dir / "bin" / "python"
-
-
-def _build_worker_env(py_exe: Path) -> dict:
-    env = os.environ.copy()
-    env.update(
-        {
-            "PYTHONPATH": "",
-            "LANG": "en_US.UTF-8",
-            "LC_ALL": "en_US.UTF-8",
-            "HOME": str(Path.home()),
-            "TOKENIZERS_PARALLELISM": "false",
-        }
-    )
-
-    path_parts = [str(py_exe.parent)]
-    if IS_WINDOWS:
-        path_parts.extend([str(Path(sys.executable).parent), env.get("PATH", "")])
-    else:
-        path_parts.extend(["/usr/local/bin", "/usr/bin", "/bin", env.get("PATH", "")])
-    env["PATH"] = os.pathsep.join([p for p in path_parts if p])
-
-    if not IS_WINDOWS:
-        env.pop("LD_LIBRARY_PATH", None)
-    return env
-
-
-def _popen_kwargs() -> dict:
-    kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE}
-    if IS_WINDOWS:
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        kwargs["start_new_session"] = True
-    return kwargs
-
-
-def _spawn_worker(cmd: list[str], env: dict) -> subprocess.Popen:
-    return subprocess.Popen(cmd, env=env, **_popen_kwargs())
 
 
 def _terminate_pid(pid: int) -> bool:
@@ -326,104 +289,57 @@ async def startup_event():
 
 def transcribe_audio(audio_path: str, language: str = "en", job_id: Optional[str] = None,
                      model_size: Optional[str] = None, adv: dict = None) -> tuple[list, dict]:
-    import tempfile
-
-    python_bin = str(_VENV_PYTHON)
-    if not os.path.exists(python_bin):
-        raise RuntimeError(f"Whisper venv not found at {_VENV_PYTHON}.")
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
-        args_file = f.name
-        _adv = adv or {}
-        json.dump(
-            {
-                "audio_path": audio_path,
-                "language": language,
-                "model_size": model_size or WHISPER_MODEL_SIZE,
-                "device": WHISPER_DEVICE,
-                "compute_type": WHISPER_COMPUTE_TYPE,
-                "beam_size": _adv.get("beam_size", 1),
-                "temperature": _adv.get("temperature", 0.0),
-                "chunk_length": _adv.get("chunk_length", 30),
-                "no_speech_threshold": _adv.get("no_speech_threshold", 0.6),
-                "hotwords": _adv.get("hotwords", ""),
-                "condition_on_prev": _adv.get("condition_on_prev", False),
-            },
-            f,
-        )
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
-        result_file = f.name
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".ndjson", delete=False, encoding="utf-8") as f:
-        segments_file = f.name
+    _adv = adv or {}
+    options = TranscribeOptions(
+        language=language,
+        model=model_size or WHISPER_MODEL_SIZE,
+        device=WHISPER_DEVICE,
+        compute_type=WHISPER_COMPUTE_TYPE,
+        beam_size=_adv.get("beam_size", 1),
+        temperature=_adv.get("temperature", 0.0),
+        chunk_length=_adv.get("chunk_length", 30),
+        no_speech_threshold=_adv.get("no_speech_threshold", 0.6),
+        hotwords=_adv.get("hotwords", ""),
+        condition_on_prev=_adv.get("condition_on_prev", False),
+        hooks=EngineHooks(
+            on_segment=lambda seg: _append_live_segment(job_id, seg),
+            on_log=print,
+            on_process_start=lambda pid: _track_pid(job_id, pid),
+            on_process_end=lambda pid: _release_pid(job_id, pid),
+        ),
+    )
 
     if job_id:
         _live_segments[job_id] = []
 
-    proc = None
-    try:
-        proc = _spawn_worker(
-            [python_bin, str(_WHISPER_SCRIPT), args_file, result_file, segments_file],
-            env=_build_worker_env(_VENV_PYTHON),
-        )
+    engine = get_engine()
+    started = time.monotonic()
+    result = engine.transcribe(audio_path, options)
+    print(f"[INFO] engine={engine.name} job={job_id} wall_time={time.monotonic() - started:.1f}s "
+          f"segments={len(result.segments)} words={result.word_count}")
 
-        if job_id:
-            _active_pids.setdefault(job_id, []).append(proc.pid)
+    payload = result.to_payload()
+    return payload["segments"], payload["info"]
 
-        def _drain_segments():
-            try:
-                with open(segments_file, "r", encoding="utf-8") as sf:
-                    for line in sf:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            seg_dict = json.loads(line)
-                            if job_id and job_id in _live_segments:
-                                if not _live_segments[job_id] or _live_segments[job_id][-1] != seg_dict:
-                                    _live_segments[job_id].append(seg_dict)
-                        except json.JSONDecodeError:
-                            continue
-            except FileNotFoundError:
-                pass
 
-        while proc.poll() is None:
-            _drain_segments()
-            if proc.stderr:
-                line = proc.stderr.readline()
-                if line:
-                    print(line.decode(errors="replace").rstrip())
-            time.sleep(0.2)
+def _append_live_segment(job_id: Optional[str], seg_dict: dict):
+    if not job_id or job_id not in _live_segments:
+        return
+    if not _live_segments[job_id] or _live_segments[job_id][-1] != seg_dict:
+        _live_segments[job_id].append(seg_dict)
 
-        if proc.stderr:
-            for line in proc.stderr:
-                print(line.decode(errors="replace").rstrip())
 
-        proc.wait()
-        _drain_segments()
+def _track_pid(job_id: Optional[str], pid: int):
+    if job_id:
+        _active_pids.setdefault(job_id, []).append(pid)
 
-        if not os.path.exists(result_file) or os.path.getsize(result_file) == 0:
-            raise RuntimeError(f"Whisper worker crashed (exit {proc.returncode})")
 
-        with open(result_file, "r", encoding="utf-8") as f:
-            result = json.load(f)
-
-        if result.get("status") == "error":
-            raise RuntimeError(f"Whisper failed: {result.get('payload')}")
-
-        payload = result.get("payload", {})
-        return payload.get("segments", []), payload.get("info", {})
-
-    finally:
-        if job_id and job_id in _active_pids and proc is not None:
-            _active_pids[job_id] = [p for p in _active_pids[job_id] if p != proc.pid]
-            if not _active_pids[job_id]:
-                _active_pids.pop(job_id, None)
-        for p in (args_file, result_file, segments_file):
-            try:
-                os.unlink(p)
-            except FileNotFoundError:
-                pass
+def _release_pid(job_id: Optional[str], pid: int):
+    if not job_id or job_id not in _active_pids:
+        return
+    _active_pids[job_id] = [p for p in _active_pids[job_id] if p != pid]
+    if not _active_pids[job_id]:
+        _active_pids.pop(job_id, None)
 
 
 def diarize_audio(audio_path: str, num_speakers: Optional[int] = None, job: Optional[dict] = None, adv: dict = None) -> list:

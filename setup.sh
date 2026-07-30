@@ -63,6 +63,7 @@ fi
   python-multipart \
   jinja2 \
   faster-whisper \
+  requests \
   soundfile \
   ffmpeg-python \
   --quiet

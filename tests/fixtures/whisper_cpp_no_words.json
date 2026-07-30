@@ -1,0 +1,10 @@
+{
+  "task": "transcribe",
+  "language": "german",
+  "duration": 6.0,
+  "text": " Guten Tag. Wie geht es Ihnen?",
+  "segments": [
+    {"id": 0, "text": " Guten Tag.", "start": 0.0, "end": 2.5},
+    {"id": 1, "text": " Wie geht es Ihnen?", "start": 2.5, "end": 6.0, "words": []}
+  ]
+}
