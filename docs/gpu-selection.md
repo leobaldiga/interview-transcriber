@@ -17,16 +17,18 @@ The app stores one saved selection per role in `config/compute.json`
 ```json
 {
   "schema_version": 1,
-  "transcription": { "device": { "backend": "cuda", "id": "GPU-<uuid>" } },
-  "diarization":    { "device": { "backend": "cuda", "id": "GPU-<uuid>" } },
-  "whisper":        { "compute_type": "auto" }
+  "transcription": {
+    "device": { "backend": "cuda", "id": "GPU-<uuid>" },
+    "compute_type": "auto"
+  },
+  "diarization": { "device": { "backend": "cuda", "id": "GPU-<uuid>" } }
 }
 ```
 
-- `transcription` — the device Whisper runs on.
+- `transcription` — the device Whisper runs on, and its precision
+  (`transcription.compute_type`): `"auto"` (default) or an explicit mode
+  (`int8_float16`, `int8_float32`, `int8`, `float16`, `float32`).
 - `diarization` — the device pyannote runs on (may differ).
-- `whisper.compute_type` — Whisper precision: `"auto"` (default) or an explicit
-  mode (`int8_float16`, `int8_float32`, `int8`, `float16`, `float32`).
 
 Devices are addressed by **GPU UUID** (e.g. `GPU-60ce4d58-...`), not by CUDA
 index — indexes can reorder across reboots or driver updates; UUIDs cannot.
@@ -51,8 +53,9 @@ With `compute_type: "auto"`:
 
 - On CUDA, the worker probes the device in order
   `int8_float16 → int8_float32 → int8 → float16 → float32` and uses the first
-  one the device reports as supported. Pascal cards (GTX 10-series) have no
-  usable FP16 throughput, so they land on `int8_float32`.
+  one the device reports as supported. Pascal cards (GTX 10-series) are
+  expected to land on `int8_float32` (no usable FP16 throughput) — the
+  on-device probe confirms it.
 - On CPU, the order is `int8 → int8_float16 → ...` (int8 first).
 
 Explicit values are passed straight to faster-whisper and fail loudly
@@ -60,8 +63,10 @@ Explicit values are passed straight to faster-whisper and fail loudly
 
 ### No silent fallbacks
 
-- If no saved default is configured (`needs_selection`), submissions that don't
-  override the device are rejected — the user must pick one.
+- First run with **multiple GPUs** and nothing configured: submissions that
+don't override the device are rejected with `DEVICE_NOT_CONFIGURED` — the
+user must pick one. (Single-GPU and CPU-only machines auto-resolve their
+only option on first run — a deterministic resolution, not a fallback.)
 - If a selected/overridden GPU is missing at run time, the job fails with
   `DEVICE_NOT_AVAILABLE`. The app **never** falls back to another GPU or to
   CPU on its own.
@@ -79,9 +84,10 @@ Explicit values are passed straight to faster-whisper and fail loudly
 
 `WHISPER_WORKER_PYTHON` / `PYANNOTE_WORKER_PYTHON` point each worker at its
 own interpreter (absolute path, or a path relative to the repo root). Unset =
-the worker reuses the app's own venv, exactly as before — this is the
-rollback path. See [pascal-worker-profile.md](pascal-worker-profile.md) for
-the ready-made profile for Pascal GPUs.
+workers use their previous interpreters (the legacy `.venv` /
+`.venv-pyannote` defaults) — this is the rollback path. See
+[pascal-worker-profile.md](pascal-worker-profile.md) for the ready-made
+profile for Pascal GPUs.
 
 ## API
 

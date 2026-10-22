@@ -298,6 +298,7 @@
       } else {
         await loadComputeSettings();
         if (computeStatusEl) computeStatusEl.textContent = 'Saved. New jobs will use these defaults; queued/running jobs keep their submitted configuration.';
+        fetchStatus(); // refresh the VRAM monitor for the newly selected device
       }
     } catch (e) {
       if (computeStatusEl) { computeStatusEl.textContent = 'Save failed: ' + e.message; computeStatusEl.classList.add('compute-status--error'); }

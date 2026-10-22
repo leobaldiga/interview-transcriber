@@ -3,6 +3,10 @@
 The proxy is an integration surface (no unit tests existed for it before).
 These tests mock the httpx client so the tool functions run against canned
 app responses — no app process, no GPU.
+
+Running this file imports mcp_proxy, which needs the proxy's pinned
+dependencies (mcp 1.x — see requirements-mcp.txt; current mcp 2.x renamed
+FastMCP and will not import).
 """
 
 import asyncio
@@ -107,7 +111,7 @@ def test_models_note_unconfigured(fake_http):
 def test_models_note_explicit_cpu(fake_http):
     fake_http.responses["/api/compute/settings"] = _settings_payload(backend="cpu")
     out = run(mcp_proxy.list_whisper_models())
-    assert "explicitly set to CPU" in out["coresident_note"]
+    assert "resolves to CPU" in out["coresident_note"]
     assert out["selected_device"]["backend"] == "cpu"
 
 

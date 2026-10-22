@@ -161,8 +161,9 @@ Environment variables (see `.env.example`):
 The app runs on whichever GPU (or CPU) you select — saved as a default or per
 job. Open the **Compute Devices** panel in the web UI to see every CUDA device
 (UUID, name, free VRAM), pick defaults for transcription and diarization,
-choose the Whisper precision (`auto` resolves to the best mode the card
-supports — `int8_float32` on Pascal, `int8_float16` on newer cards), and run
+choose the Whisper precision (`auto` probes for the best mode the card
+supports — expected to be `int8_float32` on Pascal and `int8_float16` on
+newer cards, pending the on-device probe), and run
 the built-in compatibility test. Advanced settings adds per-job device
 overrides that are snapshotted at submission, so changing defaults never
 affects queued jobs. Jobs are strictly serialized (Whisper exits before

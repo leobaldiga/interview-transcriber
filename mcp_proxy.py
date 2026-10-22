@@ -300,8 +300,9 @@ async def list_whisper_models() -> dict:
         )
     elif selection and selection.get("backend") == "cpu":
         coresident_note = (
-            "Transcription is explicitly set to CPU — models will run much slower than "
-            "on a GPU. Pick a GPU in the app's Compute settings if speed matters."
+            "Transcription resolves to CPU (either explicitly saved or because no GPU "
+            "is available) — models will run much slower than on a GPU. Pick a GPU in "
+            "the app's Compute settings if speed matters."
         )
     else:
         coresident_note = (
