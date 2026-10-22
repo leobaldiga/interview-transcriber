@@ -79,3 +79,5 @@ uploads/
 .DS_Store
 .vscode/
 .idea/
+
+.hftoken
