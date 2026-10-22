@@ -1,0 +1,16 @@
+# Whisper worker environment — Pascal-compatible profile (compute capability 6.1+)
+#
+# Why this profile exists: the CUDA 12.8 PyTorch wheels dropped Maxwell/Pascal
+# GPU support (GTX 1050 Ti), and cuDNN >= 9.11 dropped pre-Turing architectures.
+# This stack (PyTorch 2.8.0 + CUDA 12.6 + cuDNN 9.10.2.21) is the
+# Pascal-compatible baseline. The same wheels also run on Ampere+ GPUs, so one
+# worker profile can serve either card.
+#
+# Requires Python 3.9-3.13 (no cp314+ wheels exist for torch 2.8.0).
+# Torch stack installed separately from the cu126 index (see
+# scripts/setup_worker_envs.py) — this file lists the PyPI-side packages.
+
+faster-whisper==1.2.1
+ctranslate2==4.7.1
+numpy
+soundfile
