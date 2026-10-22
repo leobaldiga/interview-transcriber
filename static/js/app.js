@@ -84,18 +84,27 @@
       updateStatusDot('status-gpu', data.gpu);
       updateStatusDot('status-whisper', data.whisper);
       updateStatusDot('status-diarization', data.diarization);
-      // Update VRAM monitor — prefer the selected device's own numbers.
+      // Update VRAM monitor — the SELECTED device's own numbers. No first-GPU
+      // fallback: if nothing valid is selected, say so instead of guessing.
       fetch('/api/vram').then(async res => {
         if (!res.ok) throw new Error('vram fetch failed');
         const vram = await res.json();
         const devices = vram.devices || [];
-        const selected = devices.find(d => d.id === vram.selected_device) || (data.devices || [])[0];
-        const name = selected ? selected.name.split('NVIDIA ').pop() : null;
-        updateVramMonitor({
-          vram_used: vram.vram_used,
-          vram_total: vram.vram_total,
-          vram_pct: vram.vram_pct,
-        }, name);
+        const selected = vram.selected_device
+          ? devices.find(d => d.id === vram.selected_device)
+          : null;
+        if (selected) {
+          const name = selected.name.split('NVIDIA ').pop();
+          updateVramMonitor({
+            vram_used: vram.vram_used,
+            vram_total: vram.vram_total,
+            vram_pct: vram.vram_pct,
+          }, name);
+        } else {
+          updateVramMonitor({ vram_used: null, vram_total: null, vram_pct: 0 }, null);
+          vramLabel.textContent = 'No valid device selected';
+          vramLabel.parentElement.title = 'Select a device in Compute settings';
+        }
       }).catch(() => {});
     } catch (e) {
       console.error('Failed to fetch status:', e);

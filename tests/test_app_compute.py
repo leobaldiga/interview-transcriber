@@ -235,6 +235,39 @@ def test_vram_reports_selected_device_not_pooled(two_gpus, client):
     assert len(vram["devices"]) == 2
 
 
+def test_vram_unconfigured_multi_gpu_does_not_guess_first_gpu(two_gpus, client):
+    """Multi-GPU + no selection: inventory returned, but no device misattributed."""
+    vram = client.get("/api/vram").json()
+    assert vram["selected_device"] is None
+    assert vram["vram_total"] is None
+    assert vram["vram_used"] is None
+    assert vram["vram_pct"] == 0
+    assert len(vram["devices"]) == 2  # inventory preserved
+
+
+def test_vram_configured_gpu_missing_does_not_guess_first_gpu(two_gpus, client, monkeypatch):
+    """A configured GPU that disappears: no first-GPU fallback in telemetry."""
+    client.put(
+        "/api/compute/settings",
+        json={"schema_version": 1, "transcription": {"device": {"backend": "cuda", "id": UUID_A}}},
+    )
+    # Simulate UUID_A vanishing from the inventory (only UUID_B remains).
+    monkeypatch.setattr(
+        app.compute_devices,
+        "list_cuda_devices",
+        lambda timeout=5.0: [
+            compute_devices.DeviceInfo(
+                "cuda", UUID_B, "NVIDIA GeForce GTX 1050 Ti", 1, "00000000:02:00.0", "580.178.04", 4096, 144, 3952
+            )
+        ],
+    )
+    vram = client.get("/api/vram").json()
+    assert vram["selected_device"] is None
+    assert vram["vram_total"] is None
+    assert vram["vram_used"] is None
+    assert len(vram["devices"]) == 1
+
+
 def test_compute_settings_endpoints(two_gpus, client):
     get = client.get("/api/compute/settings").json()
     assert get["settings"]["transcription"]["device"] is None

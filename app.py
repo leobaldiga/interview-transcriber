@@ -1113,16 +1113,17 @@ async def vram_status():
     except compute_settings.ComputeSettingsError:
         pass
 
-    # Legacy keys describe the SELECTED device when one is configured (falling
-    # back to the first GPU), so single-GPU consumers keep working without
-    # pooling memory across cards.
-    shown = next((d for d in cuda_devices if d.id == selected_id), cuda_devices[0] if cuda_devices else None)
+    # Legacy keys describe the SELECTED device only. When resolution fails
+    # (unconfigured multi-GPU, or a configured GPU that is missing) there is
+    # no selected device: the inventory is still returned, but no device is
+    # misattributed — no first-GPU fallback.
+    shown = next((d for d in cuda_devices if d.id == selected_id), None)
     if shown and shown.memory_total_mib:
         return {
             "vram_total": f"{shown.memory_total_mib / 1024:.1f} GB",
             "vram_used": f"{shown.memory_used_mib / 1024:.1f} GB",
             "vram_pct": round(shown.memory_used_mib / shown.memory_total_mib * 100) if shown.memory_total_mib else 0,
-            "selected_device": shown.id,
+            "selected_device": selected_id,
             "devices": [d.to_api() for d in cuda_devices],
         }
     return {

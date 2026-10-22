@@ -90,3 +90,5 @@ uploads/
 
 # Persistent compute settings + compatibility reports (machine-local)
 config/
+node_modules/
+node_modules

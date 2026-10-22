@@ -8,9 +8,13 @@
 import { JSDOM } from "jsdom";
 import http from "node:http";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const REPO = "/home/user/workspace/final-check/interview-transcriber";
-const BASE = "http://127.0.0.1:8791";
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO = path.dirname(path.dirname(HERE)); // tests/ui_behavior -> repo root
+const PORT = process.env.UI_TEST_PORT || "8791";
+const BASE = `http://127.0.0.1:${PORT}`;
 const GPU_3060 = "GPU-2aeb82bb-6642-0bb1-4304-c24ebbda745c";
 const GPU_1050 = "GPU-60ce4d58-ba50-b3fa-82da-3e51b259e857";
 
@@ -105,6 +109,16 @@ class FakeXHR {
 }
 window.XMLHttpRequest = FakeXHR;
 
+// jsdom has no EventSource; stub it so the post-upload SSE path can run.
+window.EventSource = class {
+  constructor() { this.readyState = 0; }
+  close() { this.readyState = 2; }
+  addEventListener() {}
+  onopen() {}
+  onmessage() {}
+  onerror() {}
+};
+
 // Silence jsdom's "not implemented" console spam.
 window._virtualConsole = dom.virtualConsole;
 dom.virtualConsole.on("jsdomError", () => {});
@@ -197,12 +211,21 @@ async function main() {
   $("btnTranscribe").click();
   await wait(() => xhrCalls.length > 0, 10000, "submission XHR");
   const submission = xhrCalls.find((c) => c.url === "/api/transcribe");
-  check("submission went to /api/transcribe", Boolean(submission));
+  check("submission FormData built for /api/transcribe", Boolean(submission));
   const sentDevice = submission && submission.formData.get("transcription_device");
-  check("per-job transcription override forwarded on submission", sentDevice === GPU_3060, String(sentDevice));
+  check("per-job transcription override included in submission", sentDevice === GPU_3060, String(sentDevice));
   check("diarization override empty when unset (saved default applies)",
     submission && !submission.formData.get("diarization_device"));
-  check("transcribe button disabled after successful upload (file consumed)",
+
+  // Wait for the (stubbed) response to be processed before lifecycle checks:
+  // the success path consumes the file, hides the info bar, and leaves the
+  // button disabled until a new file is picked.
+  await wait(
+    () => $("fileInfo").hidden === true && $("uploadProgressText").textContent.includes("Upload complete"),
+    10000,
+    "upload success handling"
+  );
+  check("successful upload consumes the file and disables transcribe",
     $("btnTranscribe").disabled);
   const file2 = new window.File([new Uint8Array(64)], "interview2.mp3", { type: "audio/mpeg" });
   Object.defineProperty($("fileInput"), "files", { value: [file2], configurable: true });
