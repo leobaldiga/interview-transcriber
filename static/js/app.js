@@ -84,8 +84,19 @@
       updateStatusDot('status-gpu', data.gpu);
       updateStatusDot('status-whisper', data.whisper);
       updateStatusDot('status-diarization', data.diarization);
-      // Update VRAM monitor
-      if (data.gpu_detail) updateVramMonitor(data.gpu_detail);
+      // Update VRAM monitor — prefer the selected device's own numbers.
+      fetch('/api/vram').then(async res => {
+        if (!res.ok) throw new Error('vram fetch failed');
+        const vram = await res.json();
+        const devices = vram.devices || [];
+        const selected = devices.find(d => d.id === vram.selected_device) || (data.devices || [])[0];
+        const name = selected ? selected.name.split('NVIDIA ').pop() : null;
+        updateVramMonitor({
+          vram_used: vram.vram_used,
+          vram_total: vram.vram_total,
+          vram_pct: vram.vram_pct,
+        }, name);
+      }).catch(() => {});
     } catch (e) {
       console.error('Failed to fetch status:', e);
       ['status-gpu', 'status-whisper', 'status-diarization'].forEach(id => {
@@ -140,17 +151,226 @@
   const vramLabel   = document.getElementById('vramLabel');
   const vramBarFill = document.getElementById('vramBarFill');
 
-  function updateVramMonitor(gpuDetail) {
+  function updateVramMonitor(gpuDetail, selectedName) {
     if (!vramLabel || !vramBarFill) return;
     const used  = gpuDetail.vram_used  || '0 GB';
     const total = gpuDetail.vram_total || '? GB';
     const pct   = gpuDetail.vram_pct   || 0;
-    vramLabel.textContent = `${used} / ${total}`;
+    vramLabel.textContent = (selectedName ? selectedName + ' ' : '') + used + ' / ' + total;
+    vramLabel.parentElement.title = selectedName
+      ? 'VRAM of ' + selectedName + ' (the selected device)'
+      : 'GPU VRAM usage';
     vramBarFill.style.width = pct + '%';
     // Color: green <50%, amber 50-80%, red >80%
     vramBarFill.style.background = pct > 80 ? 'var(--error)'
       : pct > 50 ? '#d97706' : 'var(--success)';
   }
+
+  // --- Compute devices panel ---
+  const computeTranscriptionSelect = document.getElementById('computeTranscriptionDevice');
+  const computeDiarizationSelect   = document.getElementById('computeDiarizationDevice');
+  const computePrecisionSelect     = document.getElementById('computeWhisperPrecision');
+  const computeSaveBtn             = document.getElementById('computeSaveBtn');
+  const computeTestBtn              = document.getElementById('computeTestBtn');
+  const computeTestSmoke            = document.getElementById('computeTestSmoke');
+  const computeStatusEl             = document.getElementById('computeStatus');
+  const computeTestResultEl         = document.getElementById('computeTestResult');
+  const advTranscriptionDevice      = document.getElementById('advTranscriptionDevice');
+  const advDiarizationDevice       = document.getElementById('advDiarizationDevice');
+
+  let computeDevicesCache = [];
+
+  function computeDeviceLabel(d) {
+    const free = d.memory_free_mib != null ? ` — ${(d.memory_free_mib / 1024).toFixed(1)} GB free` : '';
+    return `${d.name}${free}`;
+  }
+
+  function fillDeviceSelect(select, { allowSame = false, includeDefault = true } = {}) {
+    if (!select) return;
+    const previous = select.value;
+    select.innerHTML = '';
+    if (includeDefault) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'Not selected';
+      select.appendChild(opt);
+    }
+    if (allowSame) {
+      const opt = document.createElement('option');
+      opt.value = 'same';
+      opt.textContent = 'Same as transcription';
+      select.appendChild(opt);
+    }
+    const cpu = document.createElement('option');
+    cpu.value = 'cpu';
+    cpu.textContent = 'CPU';
+    select.appendChild(cpu);
+    computeDevicesCache.forEach(d => {
+      const opt = document.createElement('option');
+      opt.value = d.id;
+      opt.textContent = computeDeviceLabel(d);
+      select.appendChild(opt);
+    });
+    // restore selection where still valid
+    if ([...select.options].some(o => o.value === previous)) select.value = previous;
+  }
+
+  async function loadComputeDevices() {
+    try {
+      const res = await fetch('/api/compute/devices');
+      if (!res.ok) throw new Error('device fetch failed');
+      const inv = await res.json();
+      computeDevicesCache = inv.cuda_devices || [];
+      fillDeviceSelect(computeTranscriptionSelect);
+      fillDeviceSelect(computeDiarizationSelect, { allowSame: true });
+      fillDeviceSelect(advTranscriptionDevice, { includeDefault: true });
+      fillDeviceSelect(advDiarizationDevice, { includeDefault: true, allowSame: true });
+      // rebuild per-job diarization options: 'Use saved default' first
+      if (advTranscriptionDevice) advTranscriptionDevice.options[0].textContent = 'Use saved default';
+      if (advDiarizationDevice) advDiarizationDevice.options[0].textContent = 'Use saved default';
+      loadComputeSettings();
+    } catch (e) {
+      if (computeStatusEl) computeStatusEl.textContent = 'Could not enumerate devices: ' + e.message;
+    }
+  }
+
+  async function loadComputeSettings() {
+    try {
+      const res = await fetch('/api/compute/settings');
+      const data = await res.json();
+      if (!res.ok) {
+        if (computeStatusEl) {
+          computeStatusEl.textContent = data.error || 'Compute settings error';
+          computeStatusEl.classList.add('compute-status--error');
+        }
+        return;
+      }
+      const s = data.settings || {};
+      const t = (s.transcription && s.transcription.device) || null;
+      const d = (s.diarization && s.diarization.device) || null;
+      if (computeTranscriptionSelect) computeTranscriptionSelect.value = t ? (t.backend === 'cuda' ? t.id : 'cpu') : '';
+      if (computeDiarizationSelect) computeDiarizationSelect.value = d ? (d.backend === 'same_as_transcription' ? 'same' : (d.backend === 'cuda' ? d.id : 'cpu')) : 'same';
+      if (computePrecisionSelect) computePrecisionSelect.value = (s.transcription && s.transcription.compute_type) || 'auto';
+      if (computeStatusEl) {
+        computeStatusEl.classList.remove('compute-status--error');
+        if (data.needs_selection) {
+          computeStatusEl.textContent = 'No default device selected — choose one before submitting transcription jobs.';
+        } else if (data.resolution_error) {
+          computeStatusEl.textContent = data.resolution_error.message;
+          computeStatusEl.classList.add('compute-status--error');
+        } else {
+          computeStatusEl.textContent = 'Selected: ' + (data.resolved_device_name || (data.resolved && data.resolved.backend) || 'CPU');
+        }
+      }
+    } catch (e) {
+      console.error('compute settings load failed', e);
+    }
+  }
+
+  if (computeSaveBtn) computeSaveBtn.addEventListener('click', async () => {
+    const transcriptionValue = computeTranscriptionSelect.value;
+    const diarizationValue = computeDiarizationSelect.value;
+    const precision = computePrecisionSelect.value;
+    const body = {
+      schema_version: 1,
+      transcription: {
+        engine: 'faster_whisper',
+        device: transcriptionValue ? { backend: transcriptionValue === 'cpu' ? 'cpu' : 'cuda', id: transcriptionValue === 'cpu' ? null : transcriptionValue } : null,
+        compute_type: precision,
+      },
+      diarization: {
+        device: diarizationValue === 'same' ? { backend: 'same_as_transcription', id: null }
+          : diarizationValue ? { backend: diarizationValue === 'cpu' ? 'cpu' : 'cuda', id: diarizationValue === 'cpu' ? null : diarizationValue }
+          : null,
+      },
+      allow_device_fallback: false,
+    };
+    computeSaveBtn.disabled = true;
+    try {
+      const res = await fetch('/api/compute/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (computeStatusEl) { computeStatusEl.textContent = data.detail || 'Save failed'; computeStatusEl.classList.add('compute-status--error'); }
+      } else {
+        await loadComputeSettings();
+        if (computeStatusEl) computeStatusEl.textContent = 'Saved. New jobs will use these defaults; queued/running jobs keep their submitted configuration.';
+      }
+    } catch (e) {
+      if (computeStatusEl) { computeStatusEl.textContent = 'Save failed: ' + e.message; computeStatusEl.classList.add('compute-status--error'); }
+    } finally {
+      computeSaveBtn.disabled = false;
+    }
+  });
+
+  if (computeTestBtn) computeTestBtn.addEventListener('click', async () => {
+    computeTestBtn.disabled = true;
+    if (computeTestResultEl) computeTestResultEl.textContent = 'Running compatibility test… (checks run under the same lock as jobs)';
+    try {
+      const res = await fetch('/api/compute/tests', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device: computeTranscriptionSelect.value || '',
+          include_smoke: computeTestSmoke ? computeTestSmoke.checked : false,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (computeTestResultEl) computeTestResultEl.textContent = 'Test rejected: ' + (data.detail || res.status);
+        return;
+      }
+      const testId = data.test_id;
+      const poll = setInterval(async () => {
+        try {
+          const r = await fetch('/api/compute/tests/' + testId);
+          const test = await r.json();
+          if (test.status === 'running') return;
+          clearInterval(poll);
+          renderComputeTestResult(test);
+        } catch (e) { /* keep polling */ }
+      }, 1500);
+    } catch (e) {
+      if (computeTestResultEl) computeTestResultEl.textContent = 'Test failed to start: ' + e.message;
+    } finally {
+      computeTestBtn.disabled = false;
+    }
+  });
+
+  function renderComputeTestResult(test) {
+    if (!computeTestResultEl) return;
+    if (test.status === 'error') {
+      computeTestResultEl.textContent = 'Test error: ' + (test.error || 'unknown');
+      return;
+    }
+    const summary = test.summary || {};
+    const lines = [];
+    lines.push(summary.whisper_runtime ? 'Whisper runtime: PASS' : 'Whisper runtime: FAIL');
+    lines.push(summary.pyannote_runtime ? 'Pyannote runtime: PASS' : 'Pyannote runtime: FAIL');
+    for (const role of ['whisper', 'pyannote']) {
+      const steps = test[role] || {};
+      for (const [name, result] of Object.entries(steps)) {
+        if (result && result.status === 'ok') {
+          const payload = result.payload || {};
+          const bits = [];
+          if (payload.device_name) bits.push(payload.device_name);
+          if (payload.device_capability) bits.push('CC ' + payload.device_capability);
+          if (payload.compute_type) bits.push(payload.compute_type);
+          if (payload.elapsed_seconds) bits.push(payload.elapsed_seconds + 's');
+          lines.push(`  ${role}/${name}: ok${bits.length ? ' (' + bits.join(', ') + ')' : ''}`);
+        } else if (result && result.status === 'error') {
+          lines.push(`  ${role}/${name}: FAIL — ${(result.payload && result.payload.message) || 'unknown error'}`);
+        }
+      }
+    }
+    if (test.completed_at) lines.push('Completed: ' + new Date(test.completed_at).toLocaleString());
+    computeTestResultEl.textContent = lines.join('\n');
+  }
+
+  loadComputeDevices();
 
   // --- File Selection ---
   function setSelectedFile(file) {
@@ -264,6 +484,14 @@
     formData.append('adv_min_word_count',       adv('advMinWordCount', '4'));
     formData.append('adv_diarization_preset',   adv('advDiarizationPreset', 'interview'));
 
+    // Per-job device overrides (empty = saved default)
+    if (advTranscriptionDevice && advTranscriptionDevice.value) {
+      formData.append('transcription_device', advTranscriptionDevice.value);
+    }
+    if (advDiarizationDevice && advDiarizationDevice.value) {
+      formData.append('diarization_device', advDiarizationDevice.value);
+    }
+
     // Disable button during upload
     btnTranscribe.disabled = true;
     uploadProgress.hidden = false;
@@ -285,7 +513,12 @@
           if (xhr.status >= 200 && xhr.status < 300) {
             resolve(JSON.parse(xhr.responseText));
           } else {
-            reject(new Error('Upload failed: ' + xhr.status));
+            let detail = '';
+            try {
+              const body = JSON.parse(xhr.responseText);
+              detail = body.detail || body.error || '';
+            } catch (e) { /* not JSON */ }
+            reject(new Error('Upload failed: ' + xhr.status + (detail ? ' — ' + detail : '')));
           }
         });
 
@@ -315,7 +548,7 @@
 
     } catch (e) {
       console.error('Transcription upload failed:', e);
-      uploadProgressText.textContent = 'Upload failed';
+      uploadProgressText.textContent = e.message || 'Upload failed';
       uploadProgressFill.style.width = '0%';
       btnTranscribe.disabled = false;
     }
