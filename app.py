@@ -34,8 +34,11 @@ warnings.filterwarnings("ignore", message=".*MPEG_LAYER_III.*")
 _cpu_cores = multiprocessing.cpu_count()
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
+# Storage locations can be redirected via environment variables (e.g. for tests
+# or alternative deployments). UPLOADS_DIR/OUTPUTS_DIR mirror the names used
+# by mcp_proxy.py so one environment configures both processes.
+UPLOAD_DIR = Path(os.environ.get("UPLOADS_DIR") or (BASE_DIR / "uploads"))
+OUTPUT_DIR = Path(os.environ.get("OUTPUTS_DIR") or (BASE_DIR / "outputs"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
