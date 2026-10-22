@@ -255,4 +255,8 @@ The full workflow — upload, transcription, diarization, grouping, editing, exp
 
 ## License
 
-Add your preferred license here if you plan to publish or distribute the project.
+Interview Transcriber's original code is licensed under the MIT License.
+See [LICENSE](LICENSE).
+
+Third-party libraries, model weights, and bundled binaries remain subject
+to their respective licenses and terms.
