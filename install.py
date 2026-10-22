@@ -231,6 +231,11 @@ def main() -> None:
     echo("If needed, export settings from .env before launch.")
     echo("Then open http://localhost:8765")
     echo("")
+    echo("Optional — run the workers on a different GPU (e.g. a Pascal card):")
+    echo("  python3 scripts/setup_worker_envs.py   # then set WHISPER_WORKER_PYTHON /")
+    echo("                                         # PYANNOTE_WORKER_PYTHON in your shell")
+    echo("  See docs/pascal-worker-profile.md and docs/gpu-selection.md.")
+    echo("")
 
 
 if __name__ == "__main__":

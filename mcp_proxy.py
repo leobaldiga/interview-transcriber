@@ -247,28 +247,66 @@ def _parse_free_vram_mb(vram: dict | None) -> int | None:
     return None
 
 
+async def _get_compute_settings() -> dict[str, Any] | None:
+    """Fetch the app's saved compute settings (selected device etc.)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(f"{TRANSCRIBER_URL}/api/compute/settings")
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return None
+
+
+async def _selected_device_summary() -> dict[str, Any] | None:
+    """Best-effort summary of the currently selected processing device."""
+    settings = await _get_compute_settings()
+    if not settings or settings.get("resolution_error") or settings.get("needs_selection"):
+        return None
+    resolved = settings.get("resolved") or {}
+    if not resolved:
+        return None
+    return {
+        "backend": resolved.get("backend"),
+        "id": resolved.get("id"),
+        "name": settings.get("resolved_device_name"),
+    }
+
+
 # --- Tools -------------------------------------------------------------------
 
 @mcp.tool()
-def list_whisper_models() -> dict:
+async def list_whisper_models() -> dict:
     """List available Whisper transcription models with VRAM / speed / accuracy notes.
 
-    All models run via faster-whisper in int8 on CUDA (the app forces int8 on GPU),
-    so the VRAM figures are the co-resident footprint alongside Gemma on storm1's
-    RTX 3060 (12 GB).
+    VRAM notes are indicative; the actual device is whatever the app's saved
+    compute settings select (call get_compute_selection() to see it). A small
+    card (e.g. a 4 GB GTX 1050 Ti) may not fit large-class models — prefer
+    large-v3-turbo / medium / small there.
 
     IMPORTANT for the assistant: before calling transcribe_audio(), you MUST ask
     the user which model to use. Present these options (call this tool to fetch
     them) and let the user choose. Default recommendation when unsure:
     'large-v3-turbo' (low VRAM, fast, near-large-v3 accuracy).
     """
+    selection = await _selected_device_summary()
+    if selection and selection.get("backend") == "cuda":
+        coresident_note = (
+            f"Transcription runs on the selected GPU ({selection.get('name') or selection.get('id')}). "
+            "Its free VRAM is what matters for model fit. On a small card (e.g. 4 GB), "
+            "prefer large-v3-turbo / medium / small. If that GPU shares the machine with "
+            "an LLM server, the job's serialized GPU use keeps them from colliding."
+        )
+    else:
+        coresident_note = (
+            "Transcription device is CPU or not yet selected — models will run slowly on "
+            "CPU. Set a GPU in the app's Compute settings (or pass a device override to "
+            "transcribe_audio()) for meaningful speed."
+        )
     return {
         "default": "large-v3-turbo",
-        "coresident_note": (
-            "storm1 RTX 3060 has 12 GB VRAM shared with the Gemma llama.cpp server. "
-            "Prefer large-v3-turbo (~2 GB) when Gemma is loaded; use large-v3 (~3 GB) "
-            "for max accuracy when Gemma is idle."
-        ),
+        "coresident_note": coresident_note,
+        "selected_device": selection,
         "models": WHISPER_MODELS,
     }
 
@@ -296,12 +334,41 @@ def list_audio_files() -> dict:
 
 
 @mcp.tool()
+async def get_compute_selection() -> dict:
+    """Get the transcriber's saved compute selection (which GPU runs transcription
+    and diarization), plus the per-device VRAM inventory.
+
+    Returns {selected: {backend, id, name} | null, needs_selection, devices: [...]}.
+    If needs_selection is true, no default device is configured — the user must
+    pick one in the app's Compute settings (or pass a device override to
+    transcribe_audio()) before jobs will be accepted.
+    """
+    settings = await _get_compute_settings()
+    vram = await _get_vram()
+    if not settings:
+        return {"error": "Could not reach the transcriber app's compute settings API."}
+    resolved = settings.get("resolved") or {}
+    return {
+        "selected": {
+            "backend": resolved.get("backend"),
+            "id": resolved.get("id"),
+            "name": settings.get("resolved_device_name"),
+        } if resolved else None,
+        "needs_selection": bool(settings.get("needs_selection")),
+        "resolution_error": settings.get("resolution_error"),
+        "devices": (vram or {}).get("devices", []),
+    }
+
+
+@mcp.tool()
 async def transcribe_audio(
     audio_path: str,
     whisper_model: str,
     language: str = "auto",
     num_speakers: int = 0,
     group: str = "MCP",
+    transcription_device: str = "",
+    diarization_device: str = "",
 ) -> dict:
     """Submit an audio file for transcription + diarization through the Interview Transcriber app.
 
@@ -321,6 +388,10 @@ async def transcribe_audio(
             Set explicitly for best non-English accuracy.
         num_speakers: Optional hint for diarization (exact speaker count).
         group: Output group name (creates outputs/<group>/<job_id>/). Default "MCP".
+        transcription_device: Optional per-job override — GPU UUID or "cpu".
+            Empty = the app's saved default. The proxy never picks a GPU itself.
+        diarization_device: Optional per-job override — GPU UUID, "cpu", or "same"
+            (follow this job's transcription device). Empty = saved default.
 
     Returns:
         {job_id, status:"queued", vram, warning?} on success,
@@ -348,15 +419,28 @@ async def transcribe_audio(
             "uploads_dir": str(UPLOADS_DIR),
         }
 
-    # Pre-flight VRAM check (non-blocking warn + suggest).
+    # Pre-flight VRAM check — device-specific, never pooled across GPUs.
+    # If a per-job override names a GPU, warn from that device's inventory;
+    # otherwise /api/vram already reports the SELECTED device.
     vram = await _get_vram()
-    free_mb = _parse_free_vram_mb(vram)
+    free_mb = None
+    if transcription_device and transcription_device not in ("cpu", "same", ""):
+        for dev in (vram or {}).get("devices", []):
+            if dev.get("id") == transcription_device:
+                free_mb = dev.get("memory_free_mib")
+                break
+    if free_mb is None:
+        free_mb = _parse_free_vram_mb(vram)
     warning = None
-    if free_mb is not None and free_mb < VRAM_WARN_MB:
+    if transcription_device == "cpu":
         warning = (
-            f"Low free VRAM (~{free_mb} MiB free). Gemma may be loaded. Consider a "
-            "lighter model (large-v3-turbo / medium / small) or wait for Gemma to "
-            "idle. Job submitted anyway — the app's queue serializes GPU work."
+            "This job overrides transcription to CPU — expect much slower transcription."
+        )
+    elif free_mb is not None and free_mb < VRAM_WARN_MB:
+        warning = (
+            f"Low free VRAM on the target device (~{free_mb} MiB free). Consider a "
+            "lighter model (large-v3-turbo / medium / small) or move to a GPU with "
+            "headroom. Job submitted anyway — the app's queue serializes GPU work."
         )
 
     # Submit via the app's existing multipart endpoint (loopback). Streams the file
@@ -372,6 +456,8 @@ async def transcribe_audio(
                         "num_speakers": "" if num_speakers <= 0 else str(num_speakers),
                         "group": group,
                         "whisper_model": whisper_model,
+                        "transcription_device": transcription_device,
+                        "diarization_device": diarization_device,
                     },
                 )
             resp.raise_for_status()
@@ -459,6 +545,9 @@ async def get_job(job_id: str) -> dict:
         truncated = True
 
     duration_s = job.get("duration")
+    execution = job.get("execution") or {}
+    transcription_exec = execution.get("transcription") or {}
+    diarization_exec = execution.get("diarization") or {}
     return {
         "job_id": job_id,
         "status": "done",
@@ -468,6 +557,18 @@ async def get_job(job_id: str) -> dict:
         "num_speakers": job.get("num_speakers"),
         "whisper_model": job.get("whisper_model"),
         "group": job.get("group"),
+        "execution": {
+            "transcription": {
+                k: transcription_exec.get(k)
+                for k in ("device", "device_id", "device_name", "compute_type", "elapsed_seconds")
+                if transcription_exec.get(k) is not None
+            },
+            "diarization": {
+                k: diarization_exec.get(k)
+                for k in ("device", "device_id", "device_name", "elapsed_seconds")
+                if diarization_exec.get(k) is not None
+            },
+        },
         "transcript": transcript,
         "truncated": truncated,
         "transcript_path": files.get("txt"),
