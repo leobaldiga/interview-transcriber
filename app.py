@@ -1103,12 +1103,14 @@ async def vram_status():
         cuda_devices = []
 
     selected_id = None
+    selected_backend = None
     try:
         settings = _compute_store.load()
         resolved = compute_settings.resolve_settings_device(
             settings, {d.id for d in cuda_devices}
         )
-        if resolved.get("backend") == "cuda":
+        selected_backend = resolved.get("backend")
+        if selected_backend == "cuda":
             selected_id = resolved["id"]
     except compute_settings.ComputeSettingsError:
         pass
@@ -1116,7 +1118,8 @@ async def vram_status():
     # Legacy keys describe the SELECTED device only. When resolution fails
     # (unconfigured multi-GPU, or a configured GPU that is missing) there is
     # no selected device: the inventory is still returned, but no device is
-    # misattributed — no first-GPU fallback.
+    # misattributed — no first-GPU fallback. A valid CPU selection is
+    # reported via selected_backend (no GPU VRAM to show).
     shown = next((d for d in cuda_devices if d.id == selected_id), None)
     if shown and shown.memory_total_mib:
         return {
@@ -1124,6 +1127,7 @@ async def vram_status():
             "vram_used": f"{shown.memory_used_mib / 1024:.1f} GB",
             "vram_pct": round(shown.memory_used_mib / shown.memory_total_mib * 100) if shown.memory_total_mib else 0,
             "selected_device": selected_id,
+            "selected_backend": selected_backend,
             "devices": [d.to_api() for d in cuda_devices],
         }
     return {
@@ -1131,6 +1135,7 @@ async def vram_status():
         "vram_used": None,
         "vram_pct": 0,
         "selected_device": selected_id,
+        "selected_backend": selected_backend,
         "devices": [d.to_api() for d in cuda_devices],
     }
 

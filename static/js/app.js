@@ -100,6 +100,11 @@
             vram_total: vram.vram_total,
             vram_pct: vram.vram_pct,
           }, name);
+        } else if (vram.selected_backend === 'cpu') {
+          // A valid CPU selection — nothing is wrong, there's just no GPU VRAM.
+          updateVramMonitor({ vram_used: null, vram_total: null, vram_pct: 0 }, null);
+          vramLabel.textContent = 'CPU selected — no GPU VRAM';
+          vramLabel.parentElement.title = 'Transcription runs on CPU';
         } else {
           updateVramMonitor({ vram_used: null, vram_total: null, vram_pct: 0 }, null);
           vramLabel.textContent = 'No valid device selected';

@@ -6,7 +6,8 @@ ui_behavior_test.mjs drives the real app.js against these handlers.
 
 Storage is forced into a temp dir and COMPUTE_SETTINGS_PATH into a scratch
 file BEFORE importing app, so running this can never touch real uploads/,
-outputs/, or saved compute defaults. Override via env if you really want.
+outputs/, or saved compute defaults. (Paths are assigned unconditionally —
+inherited env cannot leak real state into the harness.)
 """
 import os
 import sys
@@ -16,9 +17,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, REPO_ROOT)  # repo root
 
 _scratch = tempfile.mkdtemp(prefix="ui-behavior-")
-os.environ.setdefault("COMPUTE_SETTINGS_PATH", os.path.join(_scratch, "compute.json"))
-os.environ.setdefault("UPLOADS_DIR", os.path.join(_scratch, "uploads"))
-os.environ.setdefault("OUTPUTS_DIR", os.path.join(_scratch, "outputs"))
+os.environ["COMPUTE_SETTINGS_PATH"] = os.path.join(_scratch, "compute.json")
+os.environ["UPLOADS_DIR"] = os.path.join(_scratch, "uploads")
+os.environ["OUTPUTS_DIR"] = os.path.join(_scratch, "outputs")
 
 import compute_devices
 

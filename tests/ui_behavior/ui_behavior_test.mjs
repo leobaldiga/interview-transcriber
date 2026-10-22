@@ -233,6 +233,25 @@ async function main() {
   await wait(() => !$("btnTranscribe").disabled, 5000, "button re-enabled on new file");
   check("selecting a new file re-enables the button", true);
 
+  // --- 6. A CPU selection is valid: VRAM panel says so, not 'no valid device' ---
+  trans.value = "cpu";
+  $("computeSaveBtn").click();
+  await wait(
+    () => $("computeStatus") && $("computeStatus").textContent.startsWith("Saved."),
+    10000,
+    "cpu save status"
+  );
+  await wait(
+    () => {
+      const label = $("vramLabel");
+      return label && /CPU selected/.test(label.textContent);
+    },
+    15000,
+    "cpu VRAM label"
+  );
+  check("CPU selection shows 'CPU selected — no GPU VRAM'",
+    /CPU selected/.test($("vramLabel").textContent), $("vramLabel").textContent);
+
   // --- report ---
   if (failures.length) {
     console.error(`\n${failures.length} FAILURE(S):`);

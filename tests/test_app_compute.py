@@ -245,6 +245,19 @@ def test_vram_unconfigured_multi_gpu_does_not_guess_first_gpu(two_gpus, client):
     assert len(vram["devices"]) == 2  # inventory preserved
 
 
+def test_vram_cpu_selection_reports_cpu_backend(two_gpus, client):
+    """A valid CPU selection is not 'no valid device': backend is reported."""
+    client.put(
+        "/api/compute/settings",
+        json={"schema_version": 1, "transcription": {"device": {"backend": "cpu", "id": None}}},
+    )
+    vram = client.get("/api/vram").json()
+    assert vram["selected_backend"] == "cpu"
+    assert vram["selected_device"] is None  # no GPU to point at
+    assert vram["vram_total"] is None  # no GPU VRAM to report
+    assert len(vram["devices"]) == 2  # GPU inventory still shown
+
+
 def test_vram_configured_gpu_missing_does_not_guess_first_gpu(two_gpus, client, monkeypatch):
     """A configured GPU that disappears: no first-GPU fallback in telemetry."""
     client.put(
