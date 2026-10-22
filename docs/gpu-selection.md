@@ -87,7 +87,7 @@ the ready-made profile for Pascal GPUs.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/compute/devices` | Inventory: CUDA devices (UUID, name, VRAM, free, driver) + torch/pystun runtime availability |
+| `GET /api/compute/devices` | Device inventory: CPU entry + every CUDA device (UUID, name, VRAM, free, driver) |
 | `GET /api/compute/settings` | Saved defaults + what they resolve to right now |
 | `PUT /api/compute/settings` | Save defaults (validated; bad device UUID rejected) |
 | `POST /api/compute/tests` | Run the compatibility test suite, optionally with model smoke tests (Whisper + pyannote). Returns a test id; `GET /api/compute/tests/{id}` polls. |

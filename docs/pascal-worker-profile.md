@@ -7,19 +7,23 @@ Pascal-class GPU (GTX 10-series: 1050 Ti, 1060, 1070, 1080...).
 
 Pascal cards have no usable FP16 throughput, which changes two things:
 
-1. **Compute type** — the app's `auto` policy resolves to `int8_float32` on
-   Pascal (verified in the worker's probe order `int8_float16 → int8_float32
-   → ...`). Nothing to configure; just don't force `int8_float16`.
-2. **PyTorch build** — the pinned, known-good stack for Pascal workers is
+1. **Compute type** — the app's `auto` policy is expected to resolve to
+   `int8_float32` on Pascal, per the worker's probe order
+   (`int8_float16 → int8_float32 → ...`) — the on-device probe confirms it.
+   Nothing to configure; just don't force `int8_float16`.
+2. **PyTorch build** — the pinned stack for Pascal workers is
    `torch 2.8.0+cu126` with `cudnn 9.10.2.21` (the cu126 wheel carries that
    cudnn natively — no manual cudnn install, and no touching the host NVIDIA
    driver).
 
 The manifests in [requirements/whisper-pascal.txt](../requirements/whisper-pascal.txt)
 and [requirements/pyannote-pascal.txt](../requirements/pyannote-pascal.txt)
-pin exactly that stack, matching the versions already proven on the host
-(Storm1): faster-whisper 1.2.1, ctranslate2 4.7.1, pyannote.audio 3.3.2,
-pyannote.core 6.0.1, pyannote.metrics 4.1, pyannote.pipeline 4.0.0.
+pin that stack: `torch 2.8.0+cu126` with the cu126 wheel's native
+`cudnn 9.10.2.21` (no manual cudnn install, no touching the host NVIDIA
+driver), and the same faster-whisper / ctranslate2 / pyannote versions as
+the host's existing environments. Dependency resolution for this exact
+set has been verified; runtime behavior on the actual card is confirmed
+by the compatibility test (pending a hardware run).
 
 ## Creating the worker environments
 
@@ -60,7 +64,9 @@ compatibility Test.
 
 ```bash
 unset WHISPER_WORKER_PYTHON PYANNOTE_WORKER_PYTHON
-# restart the app; workers go back to sharing the app venv
+# restart the app; workers return to their previous interpreters
+# (the legacy .venv / .venv-pyannote defaults)
 ```
 
-The Pascal venvs can simply be deleted (`rm -rf .venv-*-pascal`).
+Saved device settings are unaffected by this. The Pascal venvs can simply
+be deleted (`rm -rf .venv-*-pascal`).

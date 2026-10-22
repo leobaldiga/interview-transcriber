@@ -294,14 +294,20 @@ async def list_whisper_models() -> dict:
         coresident_note = (
             f"Transcription runs on the selected GPU ({selection.get('name') or selection.get('id')}). "
             "Its free VRAM is what matters for model fit. On a small card (e.g. 4 GB), "
-            "prefer large-v3-turbo / medium / small. If that GPU shares the machine with "
-            "an LLM server, the job's serialized GPU use keeps them from colliding."
+            "prefer large-v3-turbo / medium / small. Note: the app serializes its own "
+            "workers, but it cannot coordinate with other processes on that GPU — an "
+            "LLM server on the same card can still cause out-of-memory errors."
+        )
+    elif selection and selection.get("backend") == "cpu":
+        coresident_note = (
+            "Transcription is explicitly set to CPU — models will run much slower than "
+            "on a GPU. Pick a GPU in the app's Compute settings if speed matters."
         )
     else:
         coresident_note = (
-            "Transcription device is CPU or not yet selected — models will run slowly on "
-            "CPU. Set a GPU in the app's Compute settings (or pass a device override to "
-            "transcribe_audio()) for meaningful speed."
+            "No transcription device is configured yet (or the saved one is unavailable). "
+            "Submissions without a device override will be rejected until a device is "
+            "selected in the app's Compute settings."
         )
     return {
         "default": "large-v3-turbo",
@@ -335,9 +341,11 @@ def list_audio_files() -> dict:
 
 @mcp.tool()
 async def get_compute_selection() -> dict:
-    """Get the transcriber's saved compute selection (which GPU runs transcription
-    and diarization), plus the per-device VRAM inventory.
+    """Get the transcriber's saved compute selection, plus the per-device VRAM inventory.
 
+    'selected' resolves the TRANSCRIPTION role (the diarization device follows
+    its own saved setting — returned raw under 'diarization_setting'; a
+    'same_as_transcription' entry follows this job's transcription device).
     Returns {selected: {backend, id, name} | null, needs_selection, devices: [...]}.
     If needs_selection is true, no default device is configured — the user must
     pick one in the app's Compute settings (or pass a device override to
@@ -356,6 +364,7 @@ async def get_compute_selection() -> dict:
         } if resolved else None,
         "needs_selection": bool(settings.get("needs_selection")),
         "resolution_error": settings.get("resolution_error"),
+        "diarization_setting": ((settings.get("settings") or {}).get("diarization") or {}).get("device"),
         "devices": (vram or {}).get("devices", []),
     }
 
@@ -369,6 +378,7 @@ async def transcribe_audio(
     group: str = "MCP",
     transcription_device: str = "",
     diarization_device: str = "",
+    whisper_compute_type: str = "",
 ) -> dict:
     """Submit an audio file for transcription + diarization through the Interview Transcriber app.
 
@@ -392,6 +402,8 @@ async def transcribe_audio(
             Empty = the app's saved default. The proxy never picks a GPU itself.
         diarization_device: Optional per-job override — GPU UUID, "cpu", or "same"
             (follow this job's transcription device). Empty = saved default.
+        whisper_compute_type: Optional per-job precision override (e.g.
+            "int8_float32"). Empty = saved default / auto policy.
 
     Returns:
         {job_id, status:"queued", vram, warning?} on success,
@@ -420,8 +432,10 @@ async def transcribe_audio(
         }
 
     # Pre-flight VRAM check — device-specific, never pooled across GPUs.
-    # If a per-job override names a GPU, warn from that device's inventory;
-    # otherwise /api/vram already reports the SELECTED device.
+    # If a per-job override names a GPU, use that device's inventory entry; if
+    # the override isn't in the inventory we deliberately do NOT fall back to
+    # the saved default's numbers — the app's submission validation will
+    # reject or explain the unknown device.
     vram = await _get_vram()
     free_mb = None
     if transcription_device and transcription_device not in ("cpu", "same", ""):
@@ -429,7 +443,7 @@ async def transcribe_audio(
             if dev.get("id") == transcription_device:
                 free_mb = dev.get("memory_free_mib")
                 break
-    if free_mb is None:
+    elif not transcription_device:
         free_mb = _parse_free_vram_mb(vram)
     warning = None
     if transcription_device == "cpu":
@@ -440,7 +454,8 @@ async def transcribe_audio(
         warning = (
             f"Low free VRAM on the target device (~{free_mb} MiB free). Consider a "
             "lighter model (large-v3-turbo / medium / small) or move to a GPU with "
-            "headroom. Job submitted anyway — the app's queue serializes GPU work."
+            "headroom. Job submitted anyway — the app's queue serializes its own "
+            "GPU work, but cannot protect against other processes on that GPU."
         )
 
     # Submit via the app's existing multipart endpoint (loopback). Streams the file
@@ -458,6 +473,7 @@ async def transcribe_audio(
                         "whisper_model": whisper_model,
                         "transcription_device": transcription_device,
                         "diarization_device": diarization_device,
+                        "whisper_compute_type": whisper_compute_type,
                     },
                 )
             resp.raise_for_status()
