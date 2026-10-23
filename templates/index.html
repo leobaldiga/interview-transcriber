@@ -254,7 +254,7 @@
 
           <!-- Compute Devices (persistent defaults) -->
           <div class="advanced-settings" id="computeSettings">
-            <button class="advanced-settings-toggle" id="computeToggle" onclick="this.closest('.advanced-settings').classList.toggle('advanced-settings--open'); this.querySelector('.adv-chevron').classList.toggle('adv-chevron--open')" type="button">&#9881; Compute Devices<span class="adv-chevron">&#9660;</span></button>
+            <button class="advanced-settings-toggle" id="computeToggle" onclick="const body = document.getElementById('computeSettingsBody'); body.hidden = !body.hidden; this.setAttribute('aria-expanded', String(!body.hidden)); this.closest('.advanced-settings').classList.toggle('advanced-settings--open', !body.hidden); this.querySelector('.adv-chevron').classList.toggle('adv-chevron--open', !body.hidden)" type="button">&#9881; Compute Devices<span class="adv-chevron">&#9660;</span></button>
             <div class="advanced-settings-body" id="computeSettingsBody" hidden>
 
               <div class="adv-section-label">Saved defaults — apply to newly submitted jobs</div>

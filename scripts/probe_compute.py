@@ -96,7 +96,7 @@ def probe_torch(device: dict) -> dict:
     a = torch.randn(512, 512, device=dev)
     b = torch.randn(512, 512, device=dev)
     c = a @ b
-    x = torch.randn(1, 1, 64, 1000, device=dev)
+    x = torch.randn(1, 1, 1000, device=dev)
     conv = torch.nn.Conv1d(1, 8, kernel_size=5).to(dev)
     y = conv(x)
     if backend == "cuda":
@@ -175,9 +175,14 @@ def probe_pyannote_smoke(device: dict, hf_token: str, audio_path: str | None) ->
     from pyannote.audio import Pipeline
 
     t0 = time.time()
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1", use_auth_token=hf_token
-    )
+    from torch.torch_version import TorchVersion
+
+    from pyannote.audio.core.task import Problem, Resolution, Specifications
+
+    with torch.serialization.safe_globals([TorchVersion, Specifications, Problem, Resolution]):
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1", use_auth_token=hf_token
+        )
     pipeline.to(torch.device("cuda:0" if device.get("backend") == "cuda" else "cpu"))
     diarization = pipeline(audio_path)
     turns = list(diarization.itertracks(yield_label=True))

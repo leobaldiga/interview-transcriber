@@ -14,3 +14,6 @@ faster-whisper==1.2.1
 ctranslate2==4.7.1
 numpy
 soundfile
+
+# Matches faster-whisper 1.2.1's audio decoding API.
+av==17.0.1
