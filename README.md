@@ -1,285 +1,251 @@
 # Interview Transcriber
 
-Local web app for transcribing, diarizing, reviewing, and organizing long-form interview audio. Everything runs on your own machine — audio never leaves it.
+Local web application for transcribing, diarizing, reviewing, and organizing long-form interview audio. Transcription and diarization run on the host rather than a hosted transcription API. Package installation and model downloads require network access; browser clients and optional MCP clients can retrieve recordings or transcripts through the application.
 
-**Stack:** FastAPI · faster-whisper · Silero VAD · pyannote.audio · ffmpeg  
-**Primary target:** Ubuntu 24.04 with an NVIDIA GPU  
-**Also supports:** Windows via `install.py`; CPU-only (slow)  
-**Optional:** MCP tool server so an LLM in Open WebUI can drive transcriptions — see [`mcp_README.md`](mcp_README.md)
+Stack: FastAPI, faster-whisper, Silero VAD, pyannote.audio, and ffmpeg. Default branch: `main`.
 
-## Overview
+## Features
 
-Built for qualitative research interviews, focus groups, oral histories, panels, and other long recordings where speaker separation matters. Upload a file in the browser, get back a speaker-labeled transcript, then clean it up in the built-in editor.
+- Audio upload, queued jobs, live transcription, and persistent job history.
+- Whisper model selection, including `large-v3-turbo`, `large-v3`, and Thai model options; primary and secondary language hints.
+- Word timestamps, speaker diarization, turn cleanup, and configurable speaker counts/presets.
+- Job groups, correction dictionaries, and a transcript editor with synchronized audio and speaker rename/merge.
+- TXT, SRT, and word-level JSON exports.
+- Persistent UUID-based GPU selection for transcription and diarization, with per-job overrides and compatibility tests.
+- Optional MCP tools for transcription, group discovery, transcript search, and chunked retrieval.
 
-Main features:
+## Installation status and requirements
 
-- Drag-and-drop upload for `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`, `.mp4`, `.webm`
-- VAD-chunked Whisper transcription with word-level timestamps and live streaming of segments as they arrive
-- Speaker diarization with pyannote, with presets for interview / focus group / panel / monologue
-- Speaker-turn cleanup: short-turn merging, backchannel absorption ("mm-hmm", "yeah"), optional cap on speaker count
-- Thai/CJK-aware speaker assignment (segment-level rather than per-character)
-- Selectable Whisper model per job, including Thai fine-tunes (Pathumma, biodatlab)
-- Primary + secondary language hint for code-switched recordings
-- Correction dictionaries (global and per-group) applied to transcribed words
-- Job groups, queueing with position display, cancel / rename / move / delete, persistent history across restarts
-- Transcript editor with synced audio playback and speaker rename/merge that regenerates all outputs
-- Downloadable `.txt`, `.srt`, and word-level `.json`
+The deployment validated on October 22, 2026 used Ubuntu 24.04, Python 3.12.3, a GTX 1050 Ti for both workers, and a separate RTX 3060 hosting an LLM. CLI and web model smoke tests passed, followed by full `large-v3-turbo` and `large-v3` jobs. This does not establish compatibility with every GPU, operating system, or dependency combination.
 
-## Architecture
+Use Python 3.12 for the documented deployment path. You also need Git, `ffmpeg` and `ffprobe` on PATH, and a Hugging Face token with access to the diarization models. Windows installation code is provided; today's hardware validation was on Linux. CPU execution is available but was not the focus of that validation. Native macOS/Metal acceleration is not established by this release.
 
-Two separate Python environments avoid torch / CUDA dependency conflicts between Whisper and pyannote:
+**Warning:** `setup.sh` and `install.py` delete and recreate `.venv` and `.venv-pyannote`. They are fresh-install/rebuild tools, not routine upgrade commands. Back up an existing deployment before rebuilding.
 
-- `.venv` — FastAPI app, `faster-whisper`, torch (for Silero VAD), and the optional MCP proxy
-- `.venv-pyannote` — pinned torch 2.8.0 + `pyannote.audio` 3.3.2
+### Current installer limitations
 
-Job flow:
+- The base installers choose CUDA 12.8 PyTorch wheels whenever `nvidia-smi` exists. They do not select a GPU-generation-specific profile automatically.
+- Several base application dependencies are unpinned. A fresh default installation is not an exact reconstruction of the validated worker stack.
+- The tested Pascal workers are installed separately using the manifests in `requirements/`. In particular, `av==17.0.1` is pinned there for faster-whisper 1.2.1 compatibility; the base installers do not consume that manifest.
+- Do not change a working host NVIDIA driver merely to install the separate worker environments.
 
-1. `app.py` receives the upload, creates a job, and enqueues it (one GPU job at a time).
-2. If needed, ffmpeg converts the file to 16 kHz mono WAV.
-3. `whisper_worker.py` runs in a subprocess from `.venv`: Silero VAD finds speech regions, merges them into ~20–30 s chunks, and faster-whisper transcribes each with word timestamps. Segments are streamed back over NDJSON so the UI updates live.
-4. Dictionary corrections are applied.
-5. `diarize_worker.py` runs in a subprocess from `.venv-pyannote` and returns speaker turns.
-6. `app.py` assigns each word to the speaker with the greatest temporal overlap, merges short turns, absorbs backchannels, relabels speakers `Speaker 0..N`, and writes outputs.
+## Hugging Face access
 
-Workers exit after each job, so VRAM is released between jobs and a CUDA crash in one worker cannot take down the server.
+Accept the terms for [speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) and [segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0), then create an appropriate token at [Hugging Face settings](https://huggingface.co/settings/tokens).
 
-## Repository layout
+The app checks `HF_TOKEN`/`HFTOKEN`, then `.hf_token`, then `.hftoken` in the repository root. The installers write `.hftoken`. Keep tokens out of Git; restrict token-file permissions on Linux with `chmod 600 .hftoken`. Missing token/model access prevents diarization.
 
-```text
-.
-├── app.py                  # FastAPI app, job queue, speaker-merge logic, output builders
-├── whisper_worker.py       # VAD + faster-whisper subprocess
-├── diarize_worker.py       # pyannote subprocess
-├── setup.sh                # Linux installer (creates both venvs)
-├── install.py              # Cross-platform installer (Windows-friendly)
-├── .env.example
-├── mcp_proxy.py            # Optional MCP tool server (see mcp_README.md)
-├── mcp_README.md
-├── requirements-mcp.txt
-├── whisper-mcp.service     # systemd user unit for the MCP proxy
-├── static/
-│   ├── css/
-│   ├── js/
-│   └── favicon.svg
-├── templates/
-│   ├── index.html          # Upload, settings, job list, previews
-│   └── editor.html         # Transcript editor
-├── uploads/                # Incoming audio (created at setup)
-└── outputs/                # <group>/<job_id>/{txt,srt,json}, jobs.json, dictionary.json
-```
+## Fresh Linux installation
 
-## Requirements
-
-- Python 3.10+ (3.12 recommended)
-- `ffmpeg` and `ffprobe` on `PATH`
-- Hugging Face token with access to the pyannote models (see below)
-- NVIDIA GPU with recent drivers for practical speed on long files. CPU-only works but is much slower; whisper falls back to `int8` on CPU automatically.
-
-Approximate VRAM (int8): `large-v3-turbo` ~1.5–2.5 GB, `large-v3` ~2.5–3.5 GB, plus ~1–2 GB for pyannote while it runs.
-
-## Hugging Face setup
-
-Diarization requires accepting the model terms for:
-
-- [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-- [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-
-Then create a token at <https://huggingface.co/settings/tokens>. The app looks for it in this order:
-
-1. `HF_TOKEN` (or `HFTOKEN`) environment variable
-2. `.hf_token` file in the repo root
-3. `.hftoken` file in the repo root (this is what the installers write)
-
-If no token is found, transcription still works but the diarization status indicator will show as unavailable and jobs will fail at the diarization step.
-
-## Installation
-
-### Linux (Ubuntu recommended)
+Run this only in a new checkout or when intentionally rebuilding the base environments. On Ubuntu 24.04:
 
 ```bash
+sudo apt update
+sudo apt install git ffmpeg python3.12 python3.12-venv python3-pip
+
 git clone https://github.com/leobaldiga/interview-transcriber.git
 cd interview-transcriber
-bash setup.sh
+
+# Select Python explicitly, rather than an unrelated python3 on PATH.
+PYTHON=/usr/bin/python3.12 /usr/bin/python3.12 install.py
 ```
 
-The script checks Python, detects `nvidia-smi` to pick CUDA (cu128) or CPU torch wheels, creates both venvs, prompts for your HF token, and writes a default `.env`.
+The cross-platform installer honors the `PYTHON` environment variable. The alternative Linux installer remains `bash setup.sh`, but it uses the first `python3` on PATH and recreates the same base environments.
 
-Start the app:
+For a Pascal GPU, continue with the separate worker profile below before submitting jobs. For other hardware, validate the default worker runtimes rather than assuming the base install is compatible.
+
+### Start in a terminal
 
 ```bash
-source .venv/bin/activate
-export $(grep -v '^#' .env | xargs)
-python app.py
+cd /path/to/interview-transcriber
+export HOST=127.0.0.1
+export PORT=8765
+.venv/bin/python app.py
 ```
 
-Open `http://localhost:8765`, or your Tailscale IP on port `8765`.
+Open `http://127.0.0.1:8765`. For access from another machine, choose an appropriate reachable bind address and restrict access using your trusted network or Tailscale. The default HOST is `0.0.0.0`; the example above deliberately limits access to localhost.
 
-### Windows
+`app.py` does not automatically load `.env`. Export needed variables in the launching shell, or set them in the service configuration. Merely editing `.env` does not configure a running service.
+
+## Pascal / GTX 10-series worker profile
+
+The validated profile uses PyTorch `2.8.0+cu126`, cuDNN `9.10.2.21`, faster-whisper `1.2.1`, CTranslate2 `4.7.1`, PyAV `17.0.1`, and pyannote.audio `3.3.2`.
+
+From an existing base installation, create the replacement workers with a known Python 3.12 interpreter:
+
+```bash
+.venv-pyannote/bin/python scripts/setup_worker_envs.py \
+    --python "$PWD/.venv-pyannote/bin/python"
+
+.venv-whisper-pascal/bin/python -m pip check
+.venv-pyannote-pascal/bin/python -m pip check
+
+export WHISPER_WORKER_PYTHON="$PWD/.venv-whisper-pascal/bin/python"
+export PYANNOTE_WORKER_PYTHON="$PWD/.venv-pyannote-pascal/bin/python"
+
+nvidia-smi --query-gpu=uuid,name --format=csv,noheader
+
+# Replace GPU-REPLACE-WITH-UUID with the intended GPU UUID.
+.venv/bin/python scripts/run_probe.py \
+    --device GPU-REPLACE-WITH-UUID --smoke --json
+```
+
+Set both worker overrides before probing; otherwise the probe uses the legacy interpreters. Require `OVERALL: PASS`. Start the app from the same shell, or put the overrides into its service configuration.
+
+The worker installer creates `.venv-whisper-pascal` and `.venv-pyannote-pascal`, leaving the two base environments untouched. It refuses existing target directories unless `--force` is supplied; that flag deletes and rebuilds the selected replacement environments. Its Python guard accepts 3.9–3.13, but Python 3.12 is the version validated here. A failed installer `pip check` currently produces a warning, so run the explicit checks above as deployment gates.
+
+Resolved package snapshots are written to `requirements/whisper-pascal-freeze.txt` and `requirements/pyannote-pascal-freeze.txt`. The installer uses the manifests, not these snapshots; they are audit records, not an automatically enforced lockfile.
+
+See [GPU selection](docs/gpu-selection.md) and [Pascal profile details](docs/pascal-worker-profile.md). Some profile notes predate the completed hardware run; the dated validation statement above records the deployment outcome.
+
+## First-run device selection
+
+1. Open Compute Devices.
+2. Choose a transcription GPU or CPU and a diarization device. Same as transcription follows the transcription selection.
+3. Leave Whisper precision on Automatic unless intentionally testing a supported explicit mode.
+4. Click Save defaults, refresh, and confirm persistence.
+5. Enable Include model smoke tests and run Test selected configuration.
+6. Submit a short real two-speaker recording; verify text, speaker assignment, and GPU allocation before processing long interviews.
+
+On an unconfigured multi-GPU machine, choose a default or explicit job override before submission. Devices are saved by UUID, not an index that can reorder. Per-job overrides are under Advanced Settings; queued/running jobs retain their submitted settings.
+
+Whisper finishes and exits before pyannote starts. Missing selected devices fail rather than silently moving work onto another GPU or CPU. On the tested 1050 Ti, supported CTranslate2 modes were `float32`, `int8`, and `int8_float32`; the application's automatic policy prefers `int8_float32` among those. Check completed-job execution metadata for the actual production selection.
+
+## Windows
+
+For a fresh install with Python 3.12 available through the launcher:
 
 ```powershell
 git clone https://github.com/leobaldiga/interview-transcriber.git
 cd interview-transcriber
-py install.py
-```
-
-Start the app:
-
-```powershell
+$env:PYTHON = (py -3.12 -c "import sys; print(sys.executable)")
+py -3.12 install.py
 .\.venv\Scripts\python.exe app.py
 ```
 
-Or activate the venv first (`.\.venv\Scripts\Activate.ps1` in PowerShell, `.venv\Scripts\activate.bat` in cmd) and run `python app.py`.
+Install ffmpeg separately and ensure `ffmpeg` and `ffprobe` are on PATH. Running the interpreter directly avoids PowerShell activation-policy changes. Windows environment variables use `$env:NAME = 'value'`. The base CUDA-selection and dependency limitations above also apply; Linux Pascal validation is not a Windows compatibility guarantee.
 
-If PowerShell blocks activation with an `Activate.ps1 cannot be loaded` message:
+## Configuration
 
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+| Variable | Purpose |
+|---|---|
+| `HOST`, `PORT` | Listening address and port; defaults `0.0.0.0`, `8765` |
+| `WHISPER_MODEL` | Default model; `large-v3-turbo` |
+| `HF_TOKEN` / `HFTOKEN` | Alternative to the token files |
+| `WHISPER_WORKER_PYTHON` | Whisper subprocess interpreter; unset uses legacy default |
+| `PYANNOTE_WORKER_PYTHON` | Diarization subprocess interpreter; unset uses legacy default |
+| `COMPUTE_SETTINGS_PATH` | Saved compute settings; default `config/compute.json` |
+
+Worker interpreter paths can be absolute or relative to the repository root. Do not globally restrict the app to one GPU when relying on its full inventory and per-role device routing.
+
+### Existing systemd service
+
+For an existing `interview-transcriber.service`, inspect it before editing:
+
+```bash
+sudo systemctl cat interview-transcriber.service
+sudo systemctl edit interview-transcriber.service
 ```
 
-or, for the current session only:
+Add a drop-in, substituting your actual absolute repository path:
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```ini
+[Service]
+Environment="WHISPER_WORKER_PYTHON=/absolute/path/interview-transcriber/.venv-whisper-pascal/bin/python"
+Environment="PYANNOTE_WORKER_PYTHON=/absolute/path/interview-transcriber/.venv-pyannote-pascal/bin/python"
 ```
 
-### Configuration
+After active jobs finish:
 
-Environment variables (see `.env.example`):
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart interview-transcriber.service
+sudo systemctl status interview-transcriber.service --no-pager
+sudo journalctl -u interview-transcriber.service -n 60 --no-pager
+```
 
-| Var | Default | Notes |
-|-----|---------|-------|
-| `HOST` | `0.0.0.0` | Bind address |
-| `PORT` | `8765` | HTTP port |
-| `WHISPER_MODEL` | `large-v3-turbo` | Default model when none is chosen in the UI |
-| `HF_TOKEN` | — | Hugging Face token (alternative to the token file) |
-| `WHISPER_WORKER_PYTHON` | — | Optional: interpreter for the Whisper worker (e.g. a Pascal-profile venv). Unset = legacy behavior. |
-| `PYANNOTE_WORKER_PYTHON` | — | Optional: interpreter for the diarization worker. |
-| `COMPUTE_SETTINGS_PATH` | `config/compute.json` | Location of the saved GPU selections. |
+The installers do not create this backend service automatically. Its WorkingDirectory must point to the repository, and ExecStart should run the app using `.venv/bin/python`. Interpreter overrides configure the worker environments; saved Compute Devices settings configure their hardware. Shell exports do not update a systemd service.
 
-### GPU selection
+## Upgrading an existing installation
 
-The app runs on whichever GPU (or CPU) you select — saved as a default or per
-job. Open the **Compute Devices** panel in the web UI to see every CUDA device
-(UUID, name, free VRAM), pick defaults for transcription and diarization,
-choose the Whisper precision (`auto` probes for the best mode the card
-supports — expected to be `int8_float32` on Pascal and `int8_float16` on
-newer cards, pending the on-device probe), and run
-the built-in compatibility test. Advanced settings adds per-job device
-overrides that are snapshotted at submission, so changing defaults never
-affects queued jobs. Jobs are strictly serialized (Whisper exits before
-diarization starts) and there are no silent fallbacks: a missing GPU fails
-loudly instead of hopping to another device or CPU. Details in
-[docs/gpu-selection.md](docs/gpu-selection.md).
+Do not rerun the base installers for routine updates. Back up recordings, outputs/history, correction dictionaries, tokens, compute settings, and service configuration. Review local changes first, and finish active jobs before updating the deployed checkout.
 
-Running the workers on a Pascal GPU (GTX 10-series) alongside a larger card?
-Build the pinned worker environments with `python3 scripts/setup_worker_envs.py`
-and export `WHISPER_WORKER_PYTHON` / `PYANNOTE_WORKER_PYTHON` — see
-[docs/pascal-worker-profile.md](docs/pascal-worker-profile.md).
+```bash
+cd /path/to/interview-transcriber
+git status --short
+git switch main
+git pull --ff-only origin main
+```
 
-## Using the app
+Stop if local changes or divergent history require reconciliation. Rebuild environments only when dependency changes require it, using a planned maintenance window. Restart the actual launcher/service after code changes, rerun compatibility tests, and validate representative audio. Updating Git alone does not install changed requirements.
 
-### Web UI
+### Rollback
 
-- **Upload panel** — pick a file, group, language (or auto-detect), optional secondary language, expected speaker count, and Whisper model. Expand *Advanced* to tune Whisper and diarization.
-- **Status bar** — GPU name and VRAM usage, and whether whisper and diarization are ready.
-- **Jobs list** — grouped, with live step text (`Queued — position 2 of 3`, `Diarizing — 41 speaker turns found...`). Cancel running jobs, rename, move between groups, delete.
-- **Preview / download** — view or download `.txt`, `.srt`, `.json` for each job.
-- **Editor** — open any completed job at `/editor/<job_id>` to listen and edit alongside the audio, rename speakers, or merge speaker labels. Speaker edits rewrite the `.json` source and regenerate `.txt` / `.srt`.
+Keep the old code reference and base environments until validation finishes. For a shell launch, unsetting the worker overrides returns interpreter selection to the legacy defaults after restart:
 
-### Advanced settings
+```bash
+unset WHISPER_WORKER_PYTHON PYANNOTE_WORKER_PYTHON
+```
 
-**Whisper**
+For systemd, remove or edit only the worker-override drop-in, reload systemd, and restart after jobs finish. Saved GPU selections are separate and may also need adjustment; legacy environments are not necessarily compatible with the currently selected GPU. Restore the prior code version separately if rolling back application changes.
 
-- **Model** — `large-v3-turbo` (default, fastest large model), `large-v3` (max accuracy), or a Thai fine-tune
-- **Beam size** — higher trades speed for accuracy (default 1)
-- **Temperature** — raise slightly if Whisper loops or repeats
-- **Chunk length** — only used in single-pass fallback mode
-- **No-speech threshold** — raise to suppress hallucinated text in silence
-- **Hotwords** — names, place names, and jargon you expect to hear
-- **Condition on previous text** — keeps context in single-pass mode; off by default to limit runaway hallucination
+## Workflow and outputs
 
-**Diarization**
+Upload MP3, WAV, M4A, OGG, or FLAC through the browser. Select language hints, model, group, and speaker count when known. Advanced settings expose transcription controls, diarization presets/cleanup, and per-job compute overrides.
 
-- **Preset** — Interview, Focus Group, Panel, Monologue (sets the four values below)
-- **Min turn duration** — suppresses rapid speaker flipping
-- **Min silence** — how aggressively pyannote splits turns
-- **Min cluster size** — reduces spurious extra speakers
-- **Min word count** — turns shorter than this and briefer than *min turn duration* are merged into a neighbor
-- **Number of speakers** — if set, pyannote is constrained to it and extra clusters are folded into the most frequent speakers
+Use the job list to monitor, rename, move, cancel, or delete jobs. Review/export completed results or open the synchronized transcript editor to rename/merge speakers.
 
-### Correction dictionaries
+Outputs live under `outputs/<group>/<job_id>/`: TXT, SRT, word-level JSON, and job metadata. `outputs/jobs.json` indexes job history. Dictionary files are `outputs/dictionary.json` globally and `outputs/<group>/dictionary.json` per group. Back up these directories; do not commit research recordings or transcripts. Interrupted jobs may need resubmission after a restart.
 
-`outputs/dictionary.json` (global) and `outputs/<group>/dictionary.json` (per group) map misrecognized tokens to corrections, e.g. `{"aggro": "agro", "Michigan state": "Michigan State"}`. Matching is case-insensitive on whole words; group entries override global ones. Edit through the UI or the `/api/dictionary` endpoint.
+## Architecture and repository map
 
-### Outputs
+The FastAPI app queues jobs, decodes audio with ffmpeg when needed, launches isolated worker processes, and combines word timestamps with speaker turns. Whisper performs VAD-chunked transcription; pyannote performs diarization. Worker processes exit after use so model allocations are not deliberately kept resident between jobs.
 
-Each job writes to `outputs/<group>/<job_id>/`:
+| Path | Purpose |
+|---|---|
+| `app.py`, `templates/`, `static/` | Backend and browser interface |
+| `whisper_worker.py`, `diarize_worker.py` | Model subprocesses |
+| `compute_devices.py`, `compute_settings.py`, `worker_runtime.py` | Discovery, saved selection, isolation, interpreter routing |
+| `setup.sh`, `install.py` | Base environment rebuild/install tools |
+| `scripts/setup_worker_envs.py` | Separate Pascal worker installer |
+| `scripts/run_probe.py`, `scripts/probe_compute.py` | Runtime and model compatibility probes |
+| `requirements/` | Worker manifests and environment snapshots |
+| `tests/` | Automated and browser-behavior test code |
+| `mcp_proxy.py`, `mcp_README.md` | Optional MCP integration and its setup guide |
+| `uploads/`, `outputs/`, `config/` | Local recordings, results, and machine settings |
 
-- `<name>.txt` — `[Speaker 0]: ...` paragraphs
-- `<name>.srt` — subtitles broken at speaker changes, >1.5 s gaps, 5 s, or 20 words
-- `<name>_words.json` — `{info, speakers, words[{text,start,end,speaker,probability}]}`; the source of truth for the editor
-- `job.json` — job metadata and settings used
+## API and MCP
 
-`outputs/jobs.json` is the index loaded at startup. Jobs that were mid-run when the server restarted are marked as errored and should be resubmitted.
+Common APIs include `/api/transcribe`, `/api/jobs`, `/api/jobs/{id}`, `/api/status`, `/api/vram`, `/api/groups`, transcript preview/download/editor routes, and correction dictionaries.
 
-### API
+Compute endpoints:
 
-The UI is a thin client over a JSON API you can call directly:
+- `GET /api/compute/devices`
+- `GET /api/compute/settings`
+- `PUT /api/compute/settings`
+- `POST /api/compute/tests`
+- `GET /api/compute/tests/{id}`
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/api/transcribe` | Multipart upload; returns `{job_id}` |
-| `GET` | `/api/jobs`, `/api/jobs/{id}` | List / inspect jobs |
-| `POST` | `/api/jobs/{id}/cancel`, `/rename`, `/move` | Job management |
-| `DELETE` | `/api/jobs/{id}` | Delete job and its outputs |
-| `GET` | `/api/live/{id}` | SSE stream of segments during transcription |
-| `GET` | `/api/download/{id}/{txt\|srt\|json}` | Download outputs |
-| `GET` | `/api/preview/{id}/{type}` | Output as JSON |
-| `GET` | `/api/audio/{id}`, `/api/words/{id}` | Editor data |
-| `POST` | `/api/jobs/{id}/speakers/rename`, `/merge` | Speaker relabeling |
-| `GET/POST` | `/api/dictionary` | Correction dictionaries |
-| `GET` | `/api/status`, `/api/vram` | System / GPU status |
-| `GET/POST` | `/api/groups` | Job groups |
+The optional MCP proxy normally listens on port 8002 and drives the running backend rather than executing models itself. Tools include `list_audio_files`, `list_whisper_models`, `transcribe_audio`, `get_job`, `list_jobs`, `get_compute_selection`, `list_groups`, `search_transcripts`, and `read_transcript_chunk`.
 
-### MCP tool server (optional)
-
-`mcp_proxy.py` exposes `list_audio_files`, `list_whisper_models`, `transcribe_audio`, `get_job`, and `list_jobs` as MCP tools over Streamable HTTP on port `8002`, so a local LLM in Open WebUI can transcribe files dropped into `uploads/` and read the result. It does no GPU work itself — it only drives the running app's queue. Installation, the systemd unit, and Open WebUI registration are covered in [`mcp_README.md`](mcp_README.md).
+Search can match interview identifiers, filenames/titles, or transcript text. Chunk retrieval returns character offsets and a SHA-256 fingerprint; clients should follow `next_start_char` until `has_more` is false and stop if the fingerprint changes. See [MCP setup](mcp_README.md) for installation and client configuration.
 
 ## Troubleshooting
 
-**Diarization fails but transcription works**  
-Check that you accepted both pyannote model terms, the token is readable by the app (env var or `.hftoken`), and `ffmpeg` is on `PATH`. The diarization indicator in the status bar reflects whether the token and `.venv-pyannote` were found.
+- Unsupported Python: use an explicit Python 3.12 interpreter for environment creation rather than whichever `python3` happens to resolve first.
+- CUDA OOM: verify the saved/job UUID and selected GPU's free VRAM. Use a separate GPU, a smaller model, or an explicit CPU choice; do not assume automatic fallback.
+- `metadata_errors` rejected by `av.open`: verify the worker's PyAV version. The validated Whisper profile pins 17.0.1; changing the app environment alone does not change an overridden worker environment.
+- Pyannote checkpoint loading error: compare the probe and production worker paths and capture the full error. The probe has a scoped allowlist for known checkpoint metadata; do not automatically allowlist arbitrary globals or load untrusted checkpoints unrestricted.
+- Diarization access failure: verify token readability and acceptance of both model terms.
+- Missing worker interpreter: inspect the override paths and executable permissions before rebuilding anything.
+- Empty device panel or missing UI behavior: refresh the page and inspect browser errors, then check the compute APIs and service logs.
+- Poor speaker separation: set the expected speaker count when known and review cleanup/preset settings. Smoke tests do not establish interview quality.
+- Long-recording drift: inspect VAD/chunking logs and validate on representative long audio rather than only synthetic fixtures.
 
-**"Whisper venv not found" / "pyannote venv not found"**  
-Re-run `setup.sh` or `install.py`. Both venvs must sit in the repo root as `.venv` and `.venv-pyannote`.
+## Security and privacy
 
-**CUDA crash / SIGABRT during diarization**  
-The worker reports this as an error and the server keeps running. Retry the job; if it recurs, check that the torch build in `.venv-pyannote` matches your driver and that VRAM isn't exhausted by another process (e.g. a local LLM). Consider a smaller Whisper model or waiting for the GPU to idle.
-
-**Timing drift on long recordings**  
-The VAD-chunked path in `whisper_worker.py` exists specifically to prevent cumulative drift. If VAD fails it logs a warning and falls back to single-pass mode, which can drift on multi-hour files. Test worker changes on a real long interview, not just short clips.
-
-**Too many / too few speakers**  
-Set *Number of speakers* explicitly if known. Otherwise raise *Min cluster size* to reduce spurious speakers, or lower it (Panel preset) if real speakers are being merged.
-
-**Thai or other non-spaced scripts split mid-phrase**  
-Speaker assignment is already segment-level for Thai/CJK. If turns still fragment, raise *Min turn duration*.
-
-**PowerShell activation fails**  
-See the execution-policy commands under Windows installation.
-
-## Security note
-
-The app has no authentication. It is designed to sit behind Tailscale or on `localhost`. Do not expose port `8765` (or `8002` for the MCP proxy) to an untrusted network, especially with human-subjects recordings.
-
-## Current status
-
-The full workflow — upload, transcription, diarization, grouping, editing, export, and MCP access — is in daily use. Active development is focused on worker environment compatibility, cross-platform reliability, and multilingual (Thai/English) diarization quality.
+The application has no authentication. Restrict ports 8765 and 8002 to localhost or a trusted network/Tailscale deployment; do not expose them to the public internet. Treat audio, transcripts, tokens, and backups as sensitive. Local inference does not prevent a remote browser or MCP client from accessing data through an exposed application.
 
 ## License
 
-Interview Transcriber's original code is licensed under the MIT License.
-See [LICENSE](LICENSE).
-
-Third-party libraries, model weights, and bundled binaries remain subject
-to their respective licenses and terms.
+Original application code is licensed under the [MIT License](LICENSE). Third-party libraries, model weights, and binaries remain subject to their own licenses and access terms.
