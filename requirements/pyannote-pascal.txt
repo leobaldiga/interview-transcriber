@@ -1,0 +1,17 @@
+# Pyannote diarization worker environment — Pascal-compatible profile.
+#
+# Transitive pyannote-core/metrics/pipeline pins match the versions proven in
+# the existing .venv-pyannote deployment (pyannote-core 6.0.1, metrics 4.1,
+# pipeline 4.0.0) to minimize drift from the working setup.
+#
+# Torch stack (torch==2.8.0+cu126, torchvision==0.23.0+cu126,
+# torchaudio==2.8.0+cu126, nvidia-cudnn-cu12==9.10.2.21) is installed
+# separately from the cu126 index — see scripts/setup_worker_envs.py.
+
+pyannote.audio==3.3.2
+pyannote-core==6.0.1
+pyannote-database==6.1.1
+pyannote-metrics==4.1
+pyannote-pipeline==4.0.0
+huggingface_hub==0.25.2
+matplotlib

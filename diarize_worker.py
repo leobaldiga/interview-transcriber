@@ -5,8 +5,9 @@ Called by app.py via subprocess.Popen with the venv Python executable.
 Usage (internal — do not call directly):
     python diarize_worker.py <args_json_file> <result_json_file>
 
-args_json_file contains:  { audio_path, hf_token, num_speakers }
-result_json_file written: { status: "ok"|"error", payload: [...turns] | "error message" }
+args_json_file contains:  { audio_path, hf_token, num_speakers, device }
+result_json_file written: { status: "ok"|"error", payload: [...turns] | "error message",
+                            execution: {device, device_id, device_name, ...} }
 
 Progress is printed to stderr so the parent process can read it.
 """
@@ -44,9 +45,20 @@ def main():
 
     import signal
 
-    def _write_error(msg: str):
+    def _write_error(msg: str, code: str | None = None):
+        payload = {"status": "error", "payload": msg}
+        if code:
+            payload["code"] = code
         with open(result_file, "w", encoding="utf-8") as f:
-            json.dump({"status": "error", "payload": msg}, f)
+            json.dump(payload, f)
+
+    # Explicit execution intent from the job's compute snapshot. "cuda" is a
+    # REQUIREMENT here — if CUDA is unavailable on the isolated device the job
+    # fails loudly; it never silently falls back to CPU or another GPU.
+    device = args.get("device", "cpu")
+    if device not in ("cpu", "cuda"):
+        _write_error(f"RUNTIME_INCOMPATIBLE: unknown device {device!r} (expected 'cpu' or 'cuda')", code="RUNTIME_INCOMPATIBLE")
+        sys.exit(1)
 
     def _sigabrt_handler(signum, frame):
         msg = "[diarize_worker] CUDA crash (SIGABRT) — illegal memory access in pyannote GPU inference"
@@ -143,7 +155,11 @@ def main():
         from pyannote.audio import Pipeline
         from pyannote.core import Annotation
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA_UNAVAILABLE: CUDA was requested for diarization but is not available "
+                "on the isolated device (check CUDA_VISIBLE_DEVICES and the worker environment)"
+            )
         print(f"[diarize_worker] Loading pyannote on {device}...", file=sys.stderr, flush=True)
 
         pipeline = Pipeline.from_pretrained(
@@ -221,15 +237,30 @@ def main():
             )
 
         print(f"[diarize_worker] Done — {len(turns)} turns", file=sys.stderr, flush=True)
+        device_name = None
+        try:
+            if device == "cuda" and torch.cuda.is_available():
+                device_name = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+        execution = {
+            "device": device,
+            "device_id": os.environ.get("CUDA_VISIBLE_DEVICES") or None,
+            "device_name": device_name,
+            "elapsed_seconds": round(_time.time() - t_start, 1),
+            "turns": len(turns),
+        }
         with open(result_file, "w", encoding="utf-8") as f:
-            json.dump({"status": "ok", "payload": turns}, f)
+            json.dump({"status": "ok", "payload": turns, "execution": execution}, f)
 
     except Exception as e:
         import traceback
 
         msg = f"{e}\n{traceback.format_exc()}"
         print(f"[diarize_worker] ERROR: {msg}", file=sys.stderr, flush=True)
-        _write_error(msg)
+        code = str(e).split(":", 1)[0] if ":" in str(e) and str(e).split(":", 1)[0].isupper() else None
+        with open(result_file, "w", encoding="utf-8") as f:
+            json.dump({"status": "error", "payload": msg, "code": code}, f)
         sys.exit(1)
 
 

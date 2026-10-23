@@ -81,3 +81,14 @@ uploads/
 .idea/
 
 .hftoken
+
+# =========================
+# PASCAL WORKER ENVIRONMENTS (built by scripts/setup_worker_envs.py)
+# =========================
+.venv-whisper-pascal/
+.venv-pyannote-pascal/
+
+# Persistent compute settings + compatibility reports (machine-local)
+config/
+node_modules/
+node_modules

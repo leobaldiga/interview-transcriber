@@ -152,6 +152,29 @@ Environment variables (see `.env.example`):
 | `PORT` | `8765` | HTTP port |
 | `WHISPER_MODEL` | `large-v3-turbo` | Default model when none is chosen in the UI |
 | `HF_TOKEN` | — | Hugging Face token (alternative to the token file) |
+| `WHISPER_WORKER_PYTHON` | — | Optional: interpreter for the Whisper worker (e.g. a Pascal-profile venv). Unset = legacy behavior. |
+| `PYANNOTE_WORKER_PYTHON` | — | Optional: interpreter for the diarization worker. |
+| `COMPUTE_SETTINGS_PATH` | `config/compute.json` | Location of the saved GPU selections. |
+
+### GPU selection
+
+The app runs on whichever GPU (or CPU) you select — saved as a default or per
+job. Open the **Compute Devices** panel in the web UI to see every CUDA device
+(UUID, name, free VRAM), pick defaults for transcription and diarization,
+choose the Whisper precision (`auto` probes for the best mode the card
+supports — expected to be `int8_float32` on Pascal and `int8_float16` on
+newer cards, pending the on-device probe), and run
+the built-in compatibility test. Advanced settings adds per-job device
+overrides that are snapshotted at submission, so changing defaults never
+affects queued jobs. Jobs are strictly serialized (Whisper exits before
+diarization starts) and there are no silent fallbacks: a missing GPU fails
+loudly instead of hopping to another device or CPU. Details in
+[docs/gpu-selection.md](docs/gpu-selection.md).
+
+Running the workers on a Pascal GPU (GTX 10-series) alongside a larger card?
+Build the pinned worker environments with `python3 scripts/setup_worker_envs.py`
+and export `WHISPER_WORKER_PYTHON` / `PYANNOTE_WORKER_PYTHON` — see
+[docs/pascal-worker-profile.md](docs/pascal-worker-profile.md).
 
 ## Using the app
 

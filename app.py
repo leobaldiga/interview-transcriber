@@ -29,13 +29,20 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+import compute_devices
+import compute_settings
+import worker_runtime
+
 warnings.filterwarnings("ignore", message=".*MPEG_LAYER_III.*")
 
 _cpu_cores = multiprocessing.cpu_count()
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
+# Storage locations can be redirected via environment variables (e.g. for tests
+# or alternative deployments). UPLOADS_DIR/OUTPUTS_DIR mirror the names used
+# by mcp_proxy.py so one environment configures both processes.
+UPLOAD_DIR = Path(os.environ.get("UPLOADS_DIR") or (BASE_DIR / "uploads"))
+OUTPUT_DIR = Path(os.environ.get("OUTPUTS_DIR") or (BASE_DIR / "outputs"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -45,22 +52,14 @@ IS_WINDOWS = os.name == "nt"
 
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3-turbo").strip() or "large-v3-turbo"
 
+# Compute settings store — persistent processing-device selection (see
+# compute_settings.py). Loaded lazily; a missing file means "unconfigured".
+_compute_store = compute_settings.ComputeSettingsStore()
 
-def _has_gpu() -> bool:
-    try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        return r.returncode == 0 and bool(r.stdout.strip())
-    except Exception:
-        return False
-
-
-WHISPER_DEVICE = "cuda" if _has_gpu() else "cpu"
-WHISPER_COMPUTE_TYPE = "float16" if WHISPER_DEVICE == "cuda" else "int8"
+# Serializes ALL GPU-allocating work: pipeline jobs (via the job queue) and
+# compatibility probes share this lock so a probe can never overlap a job's
+# model allocations.
+_gpu_work_lock = threading.Lock()
 
 
 def _load_hf_token() -> str:
@@ -94,28 +93,37 @@ def _venv_python_path(venv_dir: Path) -> Path:
     return venv_dir / "Scripts" / "python.exe" if IS_WINDOWS else venv_dir / "bin" / "python"
 
 
-def _build_worker_env(py_exe: Path) -> dict:
-    env = os.environ.copy()
-    env.update(
-        {
-            "PYTHONPATH": "",
-            "LANG": "en_US.UTF-8",
-            "LC_ALL": "en_US.UTF-8",
-            "HOME": str(Path.home()),
-            "TOKENIZERS_PARALLELISM": "false",
-        }
-    )
+def _has_gpu() -> bool:
+    try:
+        return bool(compute_devices.list_cuda_devices())
+    except compute_devices.DeviceDiscoveryError:
+        return False
 
-    path_parts = [str(py_exe.parent)]
-    if IS_WINDOWS:
-        path_parts.extend([str(Path(sys.executable).parent), env.get("PATH", "")])
-    else:
-        path_parts.extend(["/usr/local/bin", "/usr/bin", "/bin", env.get("PATH", "")])
-    env["PATH"] = os.pathsep.join([p for p in path_parts if p])
 
-    if not IS_WINDOWS:
-        env.pop("LD_LIBRARY_PATH", None)
-    return env
+def _worker_env_for(role: str, compute: dict | None) -> tuple[Path, dict]:
+    """Resolve the interpreter + environment for a worker launch.
+
+    compute is the job's immutable snapshot (job["compute"]); when absent
+    (legacy jobs) it is resolved from current settings. Never reads current
+    settings when a snapshot exists — changing defaults must not affect
+    already-accepted jobs.
+    """
+    snapshot = compute or _snapshot_from_settings()
+    stage = "transcription" if role == worker_runtime.ROLE_WHISPER else "diarization"
+    device = {"backend": snapshot[stage]["backend"], "id": snapshot[stage].get("device_id")}
+    py_exe = worker_runtime.resolve_worker_python(role)
+    return py_exe, worker_runtime.build_worker_env(py_exe, device)
+
+
+def _snapshot_from_settings() -> dict:
+    """Resolve a compute snapshot from current saved settings + hardware."""
+    try:
+        settings = _compute_store.load()
+        return compute_settings.build_job_snapshot(settings, compute_devices.available_cuda_ids())
+    except compute_devices.DeviceDiscoveryError as e:
+        raise RuntimeError(f"DEVICE_DISCOVERY_FAILED: {e.message}") from e
+    except compute_settings.ComputeSettingsError as e:
+        raise RuntimeError(f"{e.code}: {e.message}") from e
 
 
 def _popen_kwargs() -> dict:
@@ -152,10 +160,15 @@ def _guess_media_type(path: Path) -> str:
     return media_type or "application/octet-stream"
 
 
-_VENV_PYTHON = _venv_python_path(BASE_DIR / ".venv")
-_PYANNOTE_PYTHON = _venv_python_path(BASE_DIR / ".venv-pyannote")
 _WHISPER_SCRIPT = BASE_DIR / "whisper_worker.py"
 _WORKER_SCRIPT = BASE_DIR / "diarize_worker.py"
+
+
+def _worker_python_or_none(role: str) -> Path | None:
+    try:
+        return worker_runtime.resolve_worker_python(role)
+    except worker_runtime.WorkerRuntimeError:
+        return None
 
 app = FastAPI(title="Interview Transcriber", version="5.0.0")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
@@ -325,12 +338,16 @@ async def startup_event():
 
 
 def transcribe_audio(audio_path: str, language: str = "en", job_id: Optional[str] = None,
-                     model_size: Optional[str] = None, adv: dict = None) -> tuple[list, dict]:
+                     model_size: Optional[str] = None, adv: dict = None,
+                     compute: Optional[dict] = None) -> tuple[list, dict, dict]:
     import tempfile
 
-    python_bin = str(_VENV_PYTHON)
-    if not os.path.exists(python_bin):
-        raise RuntimeError(f"Whisper venv not found at {_VENV_PYTHON}.")
+    py_exe, env = _worker_env_for(worker_runtime.ROLE_WHISPER, compute)
+    python_bin = str(py_exe)
+
+    snapshot = compute or _snapshot_from_settings()
+    device = snapshot["transcription"]["backend"]
+    requested_compute_type = snapshot["transcription"].get("requested_compute_type", "auto")
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
         args_file = f.name
@@ -340,8 +357,8 @@ def transcribe_audio(audio_path: str, language: str = "en", job_id: Optional[str
                 "audio_path": audio_path,
                 "language": language,
                 "model_size": model_size or WHISPER_MODEL_SIZE,
-                "device": WHISPER_DEVICE,
-                "compute_type": WHISPER_COMPUTE_TYPE,
+                "device": device,
+                "compute_type": requested_compute_type,
                 "beam_size": _adv.get("beam_size", 1),
                 "temperature": _adv.get("temperature", 0.0),
                 "chunk_length": _adv.get("chunk_length", 30),
@@ -364,7 +381,7 @@ def transcribe_audio(audio_path: str, language: str = "en", job_id: Optional[str
     try:
         proc = _spawn_worker(
             [python_bin, str(_WHISPER_SCRIPT), args_file, result_file, segments_file],
-            env=_build_worker_env(_VENV_PYTHON),
+            env=env,
         )
 
         if job_id:
@@ -403,16 +420,17 @@ def transcribe_audio(audio_path: str, language: str = "en", job_id: Optional[str
         _drain_segments()
 
         if not os.path.exists(result_file) or os.path.getsize(result_file) == 0:
-            raise RuntimeError(f"Whisper worker crashed (exit {proc.returncode})")
+            raise RuntimeError(f"WORKER_CRASHED: Whisper worker exited with code {proc.returncode} without a result")
 
         with open(result_file, "r", encoding="utf-8") as f:
             result = json.load(f)
 
         if result.get("status") == "error":
-            raise RuntimeError(f"Whisper failed: {result.get('payload')}")
+            code = result.get("code") or "WHISPER_FAILED"
+            raise RuntimeError(f"{code}: Whisper worker failed: {result.get('payload')}")
 
         payload = result.get("payload", {})
-        return payload.get("segments", []), payload.get("info", {})
+        return payload.get("segments", []), payload.get("info", {}), result.get("execution", {})
 
     finally:
         if job_id and job_id in _active_pids and proc is not None:
@@ -426,15 +444,16 @@ def transcribe_audio(audio_path: str, language: str = "en", job_id: Optional[str
                 pass
 
 
-def diarize_audio(audio_path: str, num_speakers: Optional[int] = None, job: Optional[dict] = None, adv: dict = None) -> list:
+def diarize_audio(audio_path: str, num_speakers: Optional[int] = None, job: Optional[dict] = None,
+                  adv: dict = None, compute: Optional[dict] = None) -> tuple[list, dict]:
     import tempfile
 
     audio_duration = job.get("duration", 0) if job else 0
-    python_bin = str(_PYANNOTE_PYTHON)
-    if not os.path.exists(python_bin):
-        raise RuntimeError(
-            f"pyannote venv not found at {_PYANNOTE_PYTHON}. Install the .venv-pyannote environment first."
-        )
+    py_exe, env = _worker_env_for(worker_runtime.ROLE_PYANNOTE, compute)
+    python_bin = str(py_exe)
+
+    snapshot = compute or _snapshot_from_settings()
+    device = snapshot["diarization"]["backend"]
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
         args_file = f.name
@@ -444,6 +463,7 @@ def diarize_audio(audio_path: str, num_speakers: Optional[int] = None, job: Opti
                 "audio_path": audio_path,
                 "hf_token": HF_TOKEN,
                 "num_speakers": num_speakers,
+                "device": device,
                 # Harmonized with the API form defaults (see /api/transcribe) so
                 # every code path uses the same, looser diarization params.
                 "min_silence": _adv.get("min_silence", 0.7),
@@ -462,7 +482,7 @@ def diarize_audio(audio_path: str, num_speakers: Optional[int] = None, job: Opti
         try:
             proc = _spawn_worker(
                 [python_bin, str(_WORKER_SCRIPT), args_file, result_file],
-                env=_build_worker_env(_PYANNOTE_PYTHON),
+                env=env,
             )
 
             _job_id = job.get("id") if job else None
@@ -500,14 +520,16 @@ def diarize_audio(audio_path: str, num_speakers: Optional[int] = None, job: Opti
             proc.wait()
             if not os.path.exists(result_file) or os.path.getsize(result_file) == 0:
                 raise RuntimeError(
-                    f"Diarization worker crashed (exit code {proc.returncode}). This is usually a CUDA context issue."
+                    f"WORKER_CRASHED: Diarization worker exited with code {proc.returncode} without a result. "
+                    f"Last worker output: {(proc.stderr.read().decode(errors='replace')[-500:] if proc.stderr else 'n/a')}"
                 )
 
             with open(result_file, "r", encoding="utf-8") as f:
                 result = json.load(f)
             if result.get("status") == "error":
-                raise RuntimeError(f"Diarization failed:\n{result.get('payload')}")
-            return result.get("payload", [])
+                code = result.get("code") or "DIARIZATION_FAILED"
+                raise RuntimeError(f"{code}: Diarization failed:\n{result.get('payload')}")
+            return result.get("payload", []), result.get("execution", {})
 
         finally:
             _job_id = job.get("id") if job else None
@@ -853,6 +875,51 @@ async def process_job(job_id: str, audio_path: str, language: str, num_speakers:
     if whisper_model:
         job["whisper_model"] = whisper_model
 
+    # Hold the GPU-work lock for the entire pipeline so compatibility probes
+    # can never overlap this job's model allocations. Acquired off the event
+    # loop thread (a blocking acquire here would deadlock the API while a
+    # probe or test holds the lock).
+    await asyncio.to_thread(_gpu_work_lock.acquire)
+    try:
+        # Revalidate the compute snapshot at execution start — AFTER the lock,
+        # so hardware changes made while the job waited are caught. Never
+        # rewrite the snapshot to whatever the current default is.
+        compute = job.get("compute")
+        if compute is not None:
+            try:
+                available = compute_devices.available_cuda_ids()
+            except compute_devices.DeviceDiscoveryError as e:
+                job["status"] = "error"
+                job["step"] = f"Error: device discovery failed"
+                job["error"] = f"DEVICE_DISCOVERY_FAILED: {e.message}"
+                _save_job_json(job_id)
+                _save_jobs_index()
+                return
+            for stage in ("transcription", "diarization"):
+                ref = compute.get(stage, {})
+                if ref.get("backend") == "cuda" and ref.get("device_id") not in available:
+                    job["status"] = "error"
+                    job["step"] = "Error: selected GPU unavailable"
+                    job["error"] = (
+                        f"DEVICE_NOT_AVAILABLE: {stage} GPU {ref.get('device_id')} disappeared before the job started. "
+                        "No fallback device was used."
+                    )
+                    _save_job_json(job_id)
+                    _save_jobs_index()
+                    return
+        await _process_job_inner(job_id, audio_path, language, num_speakers, compute)
+    finally:
+        await asyncio.to_thread(_gpu_work_lock.release)
+
+
+def _run_compute_test_with_lock(test_id: str, device_ref: dict, include_smoke: bool) -> dict:
+    with _gpu_work_lock:
+        return _run_compute_test_blocking(test_id, device_ref, include_smoke)
+
+
+async def _process_job_inner(job_id: str, audio_path: str, language: str, num_speakers: Optional[int], compute: Optional[dict]):
+    job = jobs[job_id]
+
     audio_path = str(_resolve_job_path(audio_path) or audio_path)
     stem = Path(audio_path).stem
     group = job.get("group", DEFAULT_GROUP)
@@ -897,10 +964,18 @@ async def process_job(job_id: str, audio_path: str, language: str, num_speakers:
             job["step"] = f"Transcribing (multilingual: {language}+{_secondary})..."
 
         adv = job.get("adv", {})
-        segments, info = await loop.run_in_executor(None, transcribe_audio, audio_path, _lang, job_id, _model, adv)
+        segments, info, transcription_execution = await loop.run_in_executor(
+            None, transcribe_audio, audio_path, _lang, job_id, _model, adv, compute
+        )
         job["duration"] = info.get("duration")
         job["language"] = info.get("language")
+        job["execution"] = {"transcription": transcription_execution}
         _save_jobs_index()
+
+        # Cancellation during transcription: the worker was killed and the
+        # exception path already marked the job — do not start diarization.
+        if job.get("status") not in ("transcribing", "diarizing"):
+            return
 
         dictionary = _load_dictionary(group)
         if dictionary:
@@ -912,7 +987,10 @@ async def process_job(job_id: str, audio_path: str, language: str, num_speakers:
         job["step"] = "Starting diarization subprocess..."
         _save_jobs_index()
 
-        diarization_turns = await loop.run_in_executor(None, diarize_audio, wav_path, num_speakers, job, adv)
+        diarization_turns, diarization_execution = await loop.run_in_executor(
+            None, diarize_audio, wav_path, num_speakers, job, adv, compute
+        )
+        job.setdefault("execution", {})["diarization"] = diarization_execution
 
         job["status"] = "merging"
         job["step"] = "Assigning speakers to transcript..."
@@ -983,60 +1061,278 @@ async def index(request: Request):
 
 @app.get("/api/status")
 async def system_status():
-    gpu_available = False
-    gpu_name = None
-    gpu_vram_total_mb = 0
-    gpu_vram_used_mb = 0
     try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total,memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            timeout=3,
+        cuda_devices = compute_devices.list_cuda_devices()
+    except compute_devices.DeviceDiscoveryError:
+        cuda_devices = []
+
+    # Legacy fields keep their meaning: the first GPU. Per-device data and the
+    # selected device are additive.
+    first = cuda_devices[0] if cuda_devices else None
+    selected_id = None
+    try:
+        settings = _compute_store.load()
+        resolved = compute_settings.resolve_settings_device(
+            settings, {d.id for d in cuda_devices}
         )
-        if r.returncode == 0 and r.stdout.strip():
-            parts = r.stdout.decode().strip().split(",")
-            if len(parts) >= 3:
-                gpu_available = True
-                gpu_name = parts[0].strip()
-                gpu_vram_total_mb = int(parts[1].strip())
-                gpu_vram_used_mb = int(parts[2].strip())
-    except Exception:
-        pass
+        selected_id = resolved.get("id") if resolved.get("backend") == "cuda" else "cpu"
+    except compute_settings.ComputeSettingsError:
+        selected_id = None
 
     return {
-        "gpu": gpu_available,
+        "gpu": bool(cuda_devices),
         "gpu_detail": {
-            "name": gpu_name,
-            "vram_total": f"{gpu_vram_total_mb / 1024:.1f} GB" if gpu_vram_total_mb else None,
-            "vram_used": f"{gpu_vram_used_mb / 1024:.1f} GB" if gpu_vram_total_mb else None,
-            "vram_pct": round(gpu_vram_used_mb / gpu_vram_total_mb * 100) if gpu_vram_total_mb else 0,
+            "name": first.name if first else None,
+            "id": first.id if first else None,
+            "vram_total": f"{first.memory_total_mib / 1024:.1f} GB" if first and first.memory_total_mib else None,
+            "vram_used": f"{first.memory_used_mib / 1024:.1f} GB" if first and first.memory_total_mib else None,
+            "vram_pct": round(first.memory_used_mib / first.memory_total_mib * 100) if first and first.memory_total_mib else 0,
         },
-        "whisper": _WHISPER_SCRIPT.exists() and _VENV_PYTHON.exists(),
-        "diarization": bool(HF_TOKEN) and _WORKER_SCRIPT.exists() and _PYANNOTE_PYTHON.exists(),
+        "devices": [d.to_api() for d in cuda_devices],
+        "selected_device": selected_id,
+        "whisper": _WHISPER_SCRIPT.exists() and _worker_python_or_none(worker_runtime.ROLE_WHISPER) is not None,
+        "diarization": bool(HF_TOKEN) and _WORKER_SCRIPT.exists() and _worker_python_or_none(worker_runtime.ROLE_PYANNOTE) is not None,
     }
 
 
 @app.get("/api/vram")
 async def vram_status():
     try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total,memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            timeout=3,
+        cuda_devices = compute_devices.list_cuda_devices()
+    except compute_devices.DeviceDiscoveryError:
+        cuda_devices = []
+
+    selected_id = None
+    selected_backend = None
+    try:
+        settings = _compute_store.load()
+        resolved = compute_settings.resolve_settings_device(
+            settings, {d.id for d in cuda_devices}
         )
-        if r.returncode == 0 and r.stdout.strip():
-            parts = r.stdout.decode().strip().split(",")
-            if len(parts) >= 2:
-                total_mb = int(parts[0].strip())
-                used_mb = int(parts[1].strip())
-                return {
-                    "vram_total": f"{total_mb / 1024:.1f} GB",
-                    "vram_used": f"{used_mb / 1024:.1f} GB",
-                    "vram_pct": round(used_mb / total_mb * 100) if total_mb else 0,
-                }
-    except Exception:
+        selected_backend = resolved.get("backend")
+        if selected_backend == "cuda":
+            selected_id = resolved["id"]
+    except compute_settings.ComputeSettingsError:
         pass
-    return {"vram_total": None, "vram_used": None, "vram_pct": 0}
+
+    # Legacy keys describe the SELECTED device only. When resolution fails
+    # (unconfigured multi-GPU, or a configured GPU that is missing) there is
+    # no selected device: the inventory is still returned, but no device is
+    # misattributed — no first-GPU fallback. A valid CPU selection is
+    # reported via selected_backend (no GPU VRAM to show).
+    shown = next((d for d in cuda_devices if d.id == selected_id), None)
+    if shown and shown.memory_total_mib:
+        return {
+            "vram_total": f"{shown.memory_total_mib / 1024:.1f} GB",
+            "vram_used": f"{shown.memory_used_mib / 1024:.1f} GB",
+            "vram_pct": round(shown.memory_used_mib / shown.memory_total_mib * 100) if shown.memory_total_mib else 0,
+            "selected_device": selected_id,
+            "selected_backend": selected_backend,
+            "devices": [d.to_api() for d in cuda_devices],
+        }
+    return {
+        "vram_total": None,
+        "vram_used": None,
+        "vram_pct": 0,
+        "selected_device": selected_id,
+        "selected_backend": selected_backend,
+        "devices": [d.to_api() for d in cuda_devices],
+    }
+
+
+@app.get("/api/compute/devices")
+async def compute_devices_endpoint():
+    """Allocation-free CPU/CUDA inventory for the settings UI."""
+    try:
+        return compute_devices.device_inventory()
+    except compute_devices.DeviceDiscoveryError as e:
+        raise HTTPException(500, f"{e.message}: {e.detail}")
+
+
+@app.get("/api/compute/settings")
+async def get_compute_settings():
+    try:
+        settings = _compute_store.load()
+    except compute_settings.SettingsFileError as e:
+        return JSONResponse(
+            status_code=409,
+            content={"error": e.message, "code": e.code, "recoverable_by_save": True},
+        )
+    try:
+        cuda_devices = compute_devices.list_cuda_devices()
+    except compute_devices.DeviceDiscoveryError as e:
+        cuda_devices = []
+    resolved = None
+    resolution_error = None
+    try:
+        resolved = compute_settings.resolve_settings_device(settings, {d.id for d in cuda_devices})
+    except compute_settings.ComputeSettingsError as e:
+        resolution_error = {"code": e.code, "message": e.message}
+    device_map = {d.id: d for d in cuda_devices}
+    selected_name = None
+    if resolved and resolved.get("backend") == "cuda":
+        selected_name = device_map[resolved["id"]].name if resolved["id"] in device_map else "(missing)"
+    return {
+        "settings": settings,
+        "resolved": resolved,
+        "resolved_device_name": selected_name,
+        "resolution_error": resolution_error,
+        "needs_selection": resolution_error is not None and resolution_error["code"] == "DEVICE_NOT_CONFIGURED",
+    }
+
+
+@app.put("/api/compute/settings")
+async def put_compute_settings(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Request body must be JSON")
+    try:
+        saved = _compute_store.save(body)
+    except compute_settings.ComputeSettingsError as e:
+        raise HTTPException(400, f"{e.code}: {e.message}")
+    return {"ok": True, "settings": saved}
+
+
+# --- Compatibility tests (coordinated with the job pipeline) -------------------
+
+_compute_tests: dict = {}
+_compute_tests_order: list = []
+_PROBE_TIMEOUT_S = 900
+
+
+def _launch_probe(py_exe: Path, env: dict, probe_args: dict) -> dict:
+    """Run one probe subprocess through the same launch path as production."""
+    import tempfile
+
+    probe_script = BASE_DIR / "scripts" / "probe_compute.py"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+        args_file = f.name
+        json.dump(probe_args, f)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+        result_file = f.name
+    try:
+        proc = _spawn_worker([str(py_exe), str(probe_script), args_file, result_file], env=env)
+        try:
+            proc.wait(timeout=_PROBE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except OSError:
+                pass
+            return {"status": "error", "code": "PROBE_TIMEOUT", "message": f"probe exceeded {_PROBE_TIMEOUT_S}s"}
+        if not os.path.exists(result_file) or os.path.getsize(result_file) == 0:
+            return {
+                "status": "error",
+                "code": "WORKER_CRASHED",
+                "message": f"probe exited with code {proc.returncode} without a result",
+            }
+        with open(result_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    finally:
+        for p in (args_file, result_file):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+
+
+def _run_compute_test_blocking(test_id: str, device_ref: dict, include_smoke: bool) -> dict:
+    """Sequential probe suite for one device. Must run under _gpu_work_lock."""
+    results: dict = {"device": device_ref, "started_at": datetime.now().isoformat()}
+    for role in (worker_runtime.ROLE_WHISPER, worker_runtime.ROLE_PYANNOTE):
+        try:
+            py_exe = worker_runtime.resolve_worker_python(role)
+            env = worker_runtime.build_worker_env(py_exe, device_ref)
+        except worker_runtime.WorkerRuntimeError as e:
+            results[role] = {"status": "error", "code": e.code, "message": e.message}
+            continue
+        results[role] = {}
+        results[role]["inventory"] = _launch_probe(py_exe, env, {"role": role, "device": device_ref, "mode": "inventory"})
+        results[role]["torch"] = _launch_probe(py_exe, env, {"role": role, "device": device_ref, "mode": "torch"})
+        if include_smoke:
+            mode = "whisper_smoke" if role == worker_runtime.ROLE_WHISPER else "pyannote_smoke"
+            smoke_args = {"role": role, "device": device_ref, "mode": mode}
+            if role == worker_runtime.ROLE_PYANNOTE:
+                smoke_args["hf_token"] = HF_TOKEN
+            results[role]["smoke"] = _launch_probe(py_exe, env, smoke_args)
+    results["completed_at"] = datetime.now().isoformat()
+
+    def _ok(step):
+        return isinstance(step, dict) and step.get("status") == "ok"
+
+    results["summary"] = {
+        "whisper_runtime": _ok(results.get(worker_runtime.ROLE_WHISPER, {}).get("torch")) if isinstance(results.get(worker_runtime.ROLE_WHISPER), dict) else False,
+        "pyannote_runtime": _ok(results.get(worker_runtime.ROLE_PYANNOTE, {}).get("torch")) if isinstance(results.get(worker_runtime.ROLE_PYANNOTE), dict) else False,
+    }
+    return results
+
+
+@app.post("/api/compute/tests")
+async def run_compute_test(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Request body must be JSON")
+    try:
+        device_ref = compute_settings.parse_device_override(body.get("device", ""), field="device")
+    except compute_settings.ComputeSettingsError as e:
+        raise HTTPException(400, f"{e.code}: {e.message}")
+    if device_ref is None:
+        # No explicit device: probe the currently-selected device.
+        try:
+            settings = _compute_store.load()
+            device_ref = compute_settings.resolve_settings_device(
+                settings, compute_devices.available_cuda_ids()
+            )
+        except (compute_settings.ComputeSettingsError, compute_devices.DeviceDiscoveryError) as e:
+            raise HTTPException(400, f"{getattr(e, 'code', 'DEVICE_NOT_CONFIGURED')}: {getattr(e, 'message', e)}")
+
+    include_smoke = bool(body.get("include_smoke", False))
+    test_id = str(uuid.uuid4())[:8]
+    _compute_tests[test_id] = {
+        "id": test_id,
+        "status": "running",
+        "device": device_ref,
+        "include_smoke": include_smoke,
+        "started_at": datetime.now().isoformat(),
+    }
+    while len(_compute_tests_order) >= 20:
+        _compute_tests.pop(_compute_tests_order.pop(0), None)
+    _compute_tests_order.append(test_id)
+
+    async def _runner():
+        loop = asyncio.get_event_loop()
+        try:
+            results = await loop.run_in_executor(
+                None, _run_compute_test_with_lock, test_id, device_ref, include_smoke
+            )
+            _compute_tests[test_id].update(results)
+            _compute_tests[test_id]["status"] = "done"
+            _persist_compute_report(test_id, _compute_tests[test_id])
+        except Exception as e:
+            _compute_tests[test_id]["status"] = "error"
+            _compute_tests[test_id]["error"] = f"{type(e).__name__}: {e}"[:500]
+
+    asyncio.create_task(_runner())
+    return {"test_id": test_id, "status": "running"}
+
+
+@app.get("/api/compute/tests/{test_id}")
+async def get_compute_test(test_id: str):
+    if test_id not in _compute_tests:
+        raise HTTPException(404, "Test not found")
+    return _compute_tests[test_id]
+
+
+def _persist_compute_report(test_id: str, report: dict):
+    """Persist the latest compatibility report next to the settings file."""
+    try:
+        path = _compute_store.path.parent / "compute-report.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    except OSError:
+        pass  # report persistence is best-effort; the API response is authoritative
 
 
 @app.post("/api/transcribe")
@@ -1058,11 +1354,36 @@ async def start_transcription(
     adv_min_silence: float = Form(0.7),
     adv_min_cluster_size: int = Form(35),
     adv_min_word_count: int = Form(3),
+    transcription_device: str = Form(""),
+    diarization_device: str = Form(""),
+    whisper_compute_type: str = Form(""),
 ):
     allowed_ext = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".mp4", ".webm"}
     suffix = Path(file.filename).suffix.lower()
     if suffix not in allowed_ext:
         raise HTTPException(400, f"Unsupported file type: {suffix}")
+
+    # Build the immutable compute snapshot at acceptance: saved defaults +
+    # per-job overrides, resolved against currently available hardware.
+    # Changing saved defaults later must never affect this job.
+    try:
+        settings = _compute_store.load()
+        available = compute_devices.available_cuda_ids()
+        compute_snapshot = compute_settings.build_job_snapshot(
+            settings,
+            available,
+            transcription_override=compute_settings.parse_device_override(
+                transcription_device, field="transcription_device"
+            ),
+            diarization_override=compute_settings.parse_device_override(
+                diarization_device, allow_same=True, field="diarization_device"
+            ),
+            compute_type_override=(whisper_compute_type.strip() or None),
+        )
+    except compute_settings.ComputeSettingsError as e:
+        raise HTTPException(400, f"{e.code}: {e.message}")
+    except compute_devices.DeviceDiscoveryError as e:
+        raise HTTPException(503, f"DEVICE_DISCOVERY_FAILED: {e.message}")
 
     job_id = str(uuid.uuid4())[:8]
     upload_path = UPLOAD_DIR / f"{job_id}_{Path(file.filename).name}"
@@ -1101,6 +1422,7 @@ async def start_transcription(
         "error": None,
         "whisper_model": whisper_model.strip(),
         "audio_path": _to_rel_path(upload_path),
+        "compute": compute_snapshot,
         "adv": {
             "beam_size": adv_beam_size,
             "temperature": adv_temperature,

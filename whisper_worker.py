@@ -28,6 +28,48 @@ MIN_SILENCE_S = 0.3
 MIN_SPEECH_S = 0.1
 IS_WINDOWS = os.name == "nt"
 
+# "auto" compute-type preference, most-preferred first. The runtime's
+# supported list decides: e.g. Pascal (CC 6.1) supports int8_float32 but not
+# int8_float16, so it lands on int8_float32; newer GPUs with fast FP16 land on
+# int8_float16. Explicit user selections are validated, never silently swapped.
+_CUDA_AUTO_PREFERENCE = ["int8_float16", "int8_float32", "int8", "float16", "float32"]
+_CPU_AUTO_PREFERENCE = ["int8", "int8_float32", "float32"]
+
+
+def _resolve_compute_type(requested: str, device: str) -> str:
+    """Resolve 'auto' against the installed runtime; validate explicit choices."""
+    import ctranslate2
+
+    supported = set(ctranslate2.get_supported_compute_types(device, device_index=0))
+    if requested and requested != "auto":
+        if requested not in supported:
+            raise RuntimeError(
+                f"UNSUPPORTED_COMPUTE_TYPE: {requested!r} is not supported on {device} "
+                f"(supported: {sorted(supported)})"
+            )
+        return requested
+    for candidate in (_CUDA_AUTO_PREFERENCE if device == "cuda" else _CPU_AUTO_PREFERENCE):
+        if candidate in supported:
+            return candidate
+    raise RuntimeError(
+        f"UNSUPPORTED_COMPUTE_TYPE: no usable compute type on {device} "
+        f"(supported: {sorted(supported)})"
+    )
+
+
+def _cuda_device_name(device: str):
+    """Best-effort human-readable device name for execution metadata."""
+    if device != "cuda":
+        return None
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return None
+
 
 def _which_or_raise(name: str) -> str:
     exe = shutil.which(name)
@@ -176,16 +218,22 @@ def main():
         pass
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    if not IS_WINDOWS:
-        os.environ.pop("LD_LIBRARY_PATH", None)
+    # NOTE: LD_LIBRARY_PATH is deliberately NOT popped here. The parent process
+    # builds a controlled library path from this environment's own NVIDIA
+    # packages (see worker_runtime.py); discarding it here would let a newer
+    # system cuDNN leak into the worker instead of the pinned one.
 
     try:
         _tool("ffmpeg")
         _tool("ffprobe")
         from faster_whisper import WhisperModel
 
-        if device == "cuda":
-            compute_type = "int8"
+        import time as _time
+
+        _t_start = _time.time()
+        requested_compute_type = compute_type
+        if device in ("cuda", "cpu"):
+            compute_type = _resolve_compute_type(compute_type, device)
 
         print(f"[whisper_worker] Loading {model_size} on {device} ({compute_type})...", file=sys.stderr, flush=True)
         model = WhisperModel(model_size, device=device, compute_type=compute_type)
@@ -215,34 +263,25 @@ def main():
                             continue
 
                         chunk_wav = os.path.join(tmp_dir, f"chunk_{i:04d}.wav")
-                        try:
-                            _extract_chunk(audio_path, chunk_start, chunk_end, chunk_wav)
-                        except Exception as e:
-                            print(f"[whisper_worker] chunk {i} extract failed: {e}", file=sys.stderr, flush=True)
-                            continue
+                        _extract_chunk(audio_path, chunk_start, chunk_end, chunk_wav)
 
                         _lang = None if (not lang_detected_from_first and language is None) else language
-                        try:
-                            seg_gen, info = model.transcribe(
-                                chunk_wav,
-                                task="transcribe",
-                                language=_lang,
-                                beam_size=beam_size,
-                                temperature=_temperatures,
-                                word_timestamps=True,
-                                condition_on_previous_text=False,
-                                no_speech_threshold=no_speech_threshold,
-                                hotwords=hotwords,
-                                vad_filter=False,
-                            )
-                            chunk_segs = list(seg_gen)
-                        except Exception as e:
-                            print(f"[whisper_worker] chunk {i} transcription failed: {e}", file=sys.stderr, flush=True)
-                            try:
-                                os.unlink(chunk_wav)
-                            except Exception:
-                                pass
-                            continue
+                        # A failed chunk is FATAL: skipping it would produce an
+                        # apparently-complete transcript with missing interview
+                        # content. Fail loudly instead (no partial-success mode).
+                        seg_gen, info = model.transcribe(
+                            chunk_wav,
+                            task="transcribe",
+                            language=_lang,
+                            beam_size=beam_size,
+                            temperature=_temperatures,
+                            word_timestamps=True,
+                            condition_on_previous_text=False,
+                            no_speech_threshold=no_speech_threshold,
+                            hotwords=hotwords,
+                            vad_filter=False,
+                        )
+                        chunk_segs = list(seg_gen)
 
                         if not lang_detected_from_first:
                             detected_language = info.language
@@ -325,17 +364,27 @@ def main():
             "language_probability": round(detected_lang_prob, 3),
             "duration": round(audio_duration, 2),
         }
+        execution = {
+            "device": device,
+            "device_id": os.environ.get("CUDA_VISIBLE_DEVICES") or None,
+            "device_name": _cuda_device_name(device),
+            "requested_compute_type": requested_compute_type,
+            "compute_type": compute_type,
+            "elapsed_seconds": round(_time.time() - _t_start, 1),
+            "segments": len(all_segments),
+        }
         print(f"[whisper_worker] Done. {len(all_segments)} segments, {info_dict['duration']:.1f}s audio, lang={info_dict['language']}", file=sys.stderr, flush=True)
 
         with open(result_file, "w", encoding="utf-8") as f:
-            json.dump({"status": "ok", "payload": {"segments": all_segments, "info": info_dict}}, f)
+            json.dump({"status": "ok", "payload": {"segments": all_segments, "info": info_dict}, "execution": execution}, f)
     except Exception as e:
         import traceback
 
         msg = f"{e}\n{traceback.format_exc()}"
         print(f"[whisper_worker] ERROR: {msg}", file=sys.stderr, flush=True)
+        code = str(e).split(":", 1)[0] if ":" in str(e) and str(e).split(":", 1)[0].isupper() else None
         with open(result_file, "w", encoding="utf-8") as f:
-            json.dump({"status": "error", "payload": msg}, f)
+            json.dump({"status": "error", "payload": msg, "code": code}, f)
         sys.exit(1)
 
 

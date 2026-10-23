@@ -70,7 +70,7 @@ mcp = FastMCP(
 )
 
 
-# --- Whisper model catalogue (static; VRAM figures are faster-whisper int8 --- 
+# --- Whisper model catalogue (static; VRAM figures are faster-whisper int8 ---
 # --- on CUDA, which app.py forces for cuda device) ---------------------------
 
 WHISPER_MODELS: list[dict[str, Any]] = [
@@ -192,27 +192,37 @@ def _normalize_name(name: str) -> str:
     return name
 
 
-def _completed_jobs_by_base() -> dict[str, list[str]]:
-    """Map normalized base filename -> job_ids with status == 'complete'."""
-    out: dict[str, list[str]] = {}
+def _completed_jobs_by_base() -> dict[str, list[dict]]:
+    """Map normalized base filename -> [{id, group}, ...] for completed jobs."""
+    out: dict[str, list[dict]] = {}
     for j in _load_jobs_index():
         if j.get("status") == "complete" and j.get("filename"):
             base = _normalize_name(j["filename"])
             jid = j.get("id") or j.get("job_id")
             if jid:
-                out.setdefault(base, []).append(jid)
+                out.setdefault(base, []).append({"id": jid, "group": j.get("group")})
     return out
 
 
-def _list_uploads() -> list[dict]:
+def _list_uploads(group: str | None = None) -> list[dict]:
+    """List uploaded audio files, optionally filtered to those with a completed
+    job in `group` (case-insensitive exact match on the job's group name).
+    """
     if not UPLOADS_DIR.exists():
         return []
-    done = _completed_jobs_by_base()  # base filename -> [job_id, ...]
+    done = _completed_jobs_by_base()  # base filename -> [{id, group}, ...]
+    group_norm = group.strip().lower() if group else None
     out = []
     for p in sorted(UPLOADS_DIR.iterdir()):
         if not p.is_file() or p.suffix.lower() not in AUDIO_EXTS:
             continue
-        job_ids = done.get(_normalize_name(p.name), [])
+        entries = done.get(_normalize_name(p.name), [])
+        groups = sorted({e["group"] for e in entries if e.get("group")})
+        if group_norm is not None:
+            entries = [e for e in entries if (e.get("group") or "").strip().lower() == group_norm]
+            if not entries:
+                continue  # file has no completed job in the requested group — skip
+        job_ids = [e["id"] for e in entries]
         out.append({
             "name": p.name,
             "path": str(p),
@@ -220,8 +230,19 @@ def _list_uploads() -> list[dict]:
             "duration_s": _probe_duration(p),
             "transcribed": bool(job_ids),
             "job_ids": job_ids,
+            "groups": groups,
         })
     return out
+
+
+def _list_groups() -> list[dict]:
+    """Distinct groups across all jobs with counts, for discovery."""
+    counts: dict[str, int] = {}
+    for j in _load_jobs_index():
+        g = (j.get("group") or "").strip()
+        if g:
+            counts[g] = counts.get(g, 0) + 1
+    return [{"group": g, "job_count": n} for g, n in sorted(counts.items(), key=lambda kv: -kv[1])]
 
 
 async def _get_vram() -> dict[str, Any] | None:
@@ -247,52 +268,153 @@ def _parse_free_vram_mb(vram: dict | None) -> int | None:
     return None
 
 
+async def _get_compute_settings() -> dict[str, Any] | None:
+    """Fetch the app's saved compute settings (selected device etc.)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(f"{TRANSCRIBER_URL}/api/compute/settings")
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return None
+
+
+async def _selected_device_summary() -> dict[str, Any] | None:
+    """Best-effort summary of the currently selected processing device."""
+    settings = await _get_compute_settings()
+    if not settings or settings.get("resolution_error") or settings.get("needs_selection"):
+        return None
+    resolved = settings.get("resolved") or {}
+    if not resolved:
+        return None
+    return {
+        "backend": resolved.get("backend"),
+        "id": resolved.get("id"),
+        "name": settings.get("resolved_device_name"),
+    }
+
+
 # --- Tools -------------------------------------------------------------------
 
 @mcp.tool()
-def list_whisper_models() -> dict:
+async def list_whisper_models() -> dict:
     """List available Whisper transcription models with VRAM / speed / accuracy notes.
 
-    All models run via faster-whisper in int8 on CUDA (the app forces int8 on GPU),
-    so the VRAM figures are the co-resident footprint alongside Gemma on storm1's
-    RTX 3060 (12 GB).
+    VRAM notes are indicative; the actual device is whatever the app's saved
+    compute settings select (call get_compute_selection() to see it). A small
+    card (e.g. a 4 GB GTX 1050 Ti) may not fit large-class models — prefer
+    large-v3-turbo / medium / small there.
 
     IMPORTANT for the assistant: before calling transcribe_audio(), you MUST ask
     the user which model to use. Present these options (call this tool to fetch
     them) and let the user choose. Default recommendation when unsure:
     'large-v3-turbo' (low VRAM, fast, near-large-v3 accuracy).
     """
+    selection = await _selected_device_summary()
+    if selection and selection.get("backend") == "cuda":
+        coresident_note = (
+            f"Transcription runs on the selected GPU ({selection.get('name') or selection.get('id')}). "
+            "Its free VRAM is what matters for model fit. On a small card (e.g. 4 GB), "
+            "prefer large-v3-turbo / medium / small. Note: the app serializes its own "
+            "workers, but it cannot coordinate with other processes on that GPU — an "
+            "LLM server on the same card can still cause out-of-memory errors."
+        )
+    elif selection and selection.get("backend") == "cpu":
+        coresident_note = (
+            "Transcription resolves to CPU (either explicitly saved or because no GPU "
+            "is available) — models will run much slower than on a GPU. Pick a GPU in "
+            "the app's Compute settings if speed matters."
+        )
+    else:
+        coresident_note = (
+            "No transcription device is configured yet (or the saved one is unavailable). "
+            "Submissions without a device override will be rejected until a device is "
+            "selected in the app's Compute settings."
+        )
     return {
         "default": "large-v3-turbo",
-        "coresident_note": (
-            "storm1 RTX 3060 has 12 GB VRAM shared with the Gemma llama.cpp server. "
-            "Prefer large-v3-turbo (~2 GB) when Gemma is loaded; use large-v3 (~3 GB) "
-            "for max accuracy when Gemma is idle."
-        ),
+        "coresident_note": coresident_note,
+        "selected_device": selection,
         "models": WHISPER_MODELS,
     }
 
 
 @mcp.tool()
-def list_audio_files() -> dict:
+def list_audio_files(group: str = "") -> dict:
     """List audio files available for transcription from the app's uploads/ dir.
 
-    Returns name, path, size (MB), duration (s), and whether the file has already
-    been transcribed (a completed job exists for it). Drop new files into the
-    app's uploads/ directory on the host to make them appear here.
+    Returns name, path, size (MB), duration (s), the group(s) any completed
+    transcript belongs to, and whether the file has already been transcribed.
+    Drop new files into the app's uploads/ directory on the host to make them
+    appear here.
+
+    IMPORTANT for efficiency: if you're looking for a file within a known
+    research group/project (e.g. "ARINT", "MCP"), pass `group` to narrow the
+    list instead of listing every file and scanning titles yourself. Call
+    list_groups() first if you don't know the exact group name. For finding
+    a file by topic/content rather than filename, use search_transcripts()
+    instead — it searches inside transcripts, not just filenames.
+
+    Args:
+        group: Optional. Only return files with a completed transcript in this
+            group (case-insensitive exact match). Leave empty to list all files.
 
     Pass any 'path' (or 'name') to transcribe_audio().
     """
-    files = _list_uploads()
+    files = _list_uploads(group=group or None)
     return {
         "uploads_dir": str(UPLOADS_DIR),
+        "group_filter": group or None,
         "count": len(files),
         "files": files,
         "note": "Pass a 'path' value to transcribe_audio(). Files with "
                 "'transcribed': true already have a completed transcript — use "
                 "get_job(job_id) with one of that file's 'job_ids' to retrieve it "
-                "instead of re-transcribing.",
+                "instead of re-transcribing. Use list_groups() to see available "
+                "groups, or search_transcripts() to find files by content.",
     }
+
+
+@mcp.tool()
+async def get_compute_selection() -> dict:
+    """Get the transcriber's saved compute selection, plus the per-device VRAM inventory.
+
+    'selected' resolves the TRANSCRIPTION role (the diarization device follows
+    its own saved setting — returned raw under 'diarization_setting'; a
+    'same_as_transcription' entry follows this job's transcription device).
+    Returns {selected: {backend, id, name} | null, needs_selection, devices: [...]}.
+    If needs_selection is true, no default device is configured — the user must
+    pick one in the app's Compute settings (or pass a device override to
+    transcribe_audio()) before jobs will be accepted.
+    """
+    settings = await _get_compute_settings()
+    vram = await _get_vram()
+    if not settings:
+        return {"error": "Could not reach the transcriber app's compute settings API."}
+    resolved = settings.get("resolved") or {}
+    return {
+        "selected": {
+            "backend": resolved.get("backend"),
+            "id": resolved.get("id"),
+            "name": settings.get("resolved_device_name"),
+        } if resolved else None,
+        "needs_selection": bool(settings.get("needs_selection")),
+        "resolution_error": settings.get("resolution_error"),
+        "diarization_setting": ((settings.get("settings") or {}).get("diarization") or {}).get("device"),
+        "devices": (vram or {}).get("devices", []),
+    }
+
+
+@mcp.tool()
+def list_groups() -> dict:
+    """List the distinct output groups used across all transcription jobs, with
+    job counts for each. Use this to discover valid `group` values before
+    calling list_audio_files(group=...) or list_jobs(group=...) /
+    search_transcripts(group=...) to narrow results, instead of listing every
+    file/job in the whole system.
+    """
+    groups = _list_groups()
+    return {"count": len(groups), "groups": groups}
 
 
 @mcp.tool()
@@ -302,6 +424,9 @@ async def transcribe_audio(
     language: str = "auto",
     num_speakers: int = 0,
     group: str = "MCP",
+    transcription_device: str = "",
+    diarization_device: str = "",
+    whisper_compute_type: str = "",
 ) -> dict:
     """Submit an audio file for transcription + diarization through the Interview Transcriber app.
 
@@ -321,6 +446,12 @@ async def transcribe_audio(
             Set explicitly for best non-English accuracy.
         num_speakers: Optional hint for diarization (exact speaker count).
         group: Output group name (creates outputs/<group>/<job_id>/). Default "MCP".
+        transcription_device: Optional per-job override — GPU UUID or "cpu".
+            Empty = the app's saved default. The proxy never picks a GPU itself.
+        diarization_device: Optional per-job override — GPU UUID, "cpu", or "same"
+            (follow this job's transcription device). Empty = saved default.
+        whisper_compute_type: Optional per-job precision override (e.g.
+            "int8_float32"). Empty = saved default / auto policy.
 
     Returns:
         {job_id, status:"queued", vram, warning?} on success,
@@ -348,15 +479,31 @@ async def transcribe_audio(
             "uploads_dir": str(UPLOADS_DIR),
         }
 
-    # Pre-flight VRAM check (non-blocking warn + suggest).
+    # Pre-flight VRAM check — device-specific, never pooled across GPUs.
+    # If a per-job override names a GPU, use that device's inventory entry; if
+    # the override isn't in the inventory we deliberately do NOT fall back to
+    # the saved default's numbers — the app's submission validation will
+    # reject or explain the unknown device.
     vram = await _get_vram()
-    free_mb = _parse_free_vram_mb(vram)
+    free_mb = None
+    if transcription_device and transcription_device not in ("cpu", "same", ""):
+        for dev in (vram or {}).get("devices", []):
+            if dev.get("id") == transcription_device:
+                free_mb = dev.get("memory_free_mib")
+                break
+    elif not transcription_device:
+        free_mb = _parse_free_vram_mb(vram)
     warning = None
-    if free_mb is not None and free_mb < VRAM_WARN_MB:
+    if transcription_device == "cpu":
         warning = (
-            f"Low free VRAM (~{free_mb} MiB free). Gemma may be loaded. Consider a "
-            "lighter model (large-v3-turbo / medium / small) or wait for Gemma to "
-            "idle. Job submitted anyway — the app's queue serializes GPU work."
+            "This job overrides transcription to CPU — expect much slower transcription."
+        )
+    elif free_mb is not None and free_mb < VRAM_WARN_MB:
+        warning = (
+            f"Low free VRAM on the target device (~{free_mb} MiB free). Consider a "
+            "lighter model (large-v3-turbo / medium / small) or move to a GPU with "
+            "headroom. Job submitted anyway — the app's queue serializes its own "
+            "GPU work, but cannot protect against other processes on that GPU."
         )
 
     # Submit via the app's existing multipart endpoint (loopback). Streams the file
@@ -372,6 +519,9 @@ async def transcribe_audio(
                         "num_speakers": "" if num_speakers <= 0 else str(num_speakers),
                         "group": group,
                         "whisper_model": whisper_model,
+                        "transcription_device": transcription_device,
+                        "diarization_device": diarization_device,
+                        "whisper_compute_type": whisper_compute_type,
                     },
                 )
             resp.raise_for_status()
@@ -459,6 +609,9 @@ async def get_job(job_id: str) -> dict:
         truncated = True
 
     duration_s = job.get("duration")
+    execution = job.get("execution") or {}
+    transcription_exec = execution.get("transcription") or {}
+    diarization_exec = execution.get("diarization") or {}
     return {
         "job_id": job_id,
         "status": "done",
@@ -468,6 +621,18 @@ async def get_job(job_id: str) -> dict:
         "num_speakers": job.get("num_speakers"),
         "whisper_model": job.get("whisper_model"),
         "group": job.get("group"),
+        "execution": {
+            "transcription": {
+                k: transcription_exec.get(k)
+                for k in ("device", "device_id", "device_name", "compute_type", "elapsed_seconds")
+                if transcription_exec.get(k) is not None
+            },
+            "diarization": {
+                k: diarization_exec.get(k)
+                for k in ("device", "device_id", "device_name", "elapsed_seconds")
+                if diarization_exec.get(k) is not None
+            },
+        },
         "transcript": transcript,
         "truncated": truncated,
         "transcript_path": files.get("txt"),
@@ -478,11 +643,21 @@ async def get_job(job_id: str) -> dict:
 
 
 @mcp.tool()
-async def list_jobs() -> dict:
-    """List all transcription jobs known to the app (lightweight: no transcript bodies).
+async def list_jobs(group: str = "", filename_contains: str = "") -> dict:
+    """List transcription jobs known to the app (lightweight: no transcript bodies).
 
     Each entry has id, filename, group, status, language, duration, num_speakers,
     created_at, completed_at. Use get_job(id) for the full transcript of a completed job.
+
+    IMPORTANT for efficiency: narrow with `group` and/or `filename_contains`
+    instead of listing every job and scanning it yourself. Call list_groups()
+    first if you don't know the exact group name. To find jobs by topic/content
+    rather than filename, use search_transcripts() instead.
+
+    Args:
+        group: Optional. Only return jobs in this group (case-insensitive exact match).
+        filename_contains: Optional. Only return jobs whose filename contains this
+            substring (case-insensitive).
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as c:
@@ -492,7 +667,16 @@ async def list_jobs() -> dict:
     except Exception as e:
         return {"error": f"Failed to list jobs: {type(e).__name__}: {e}"}
 
+    group_norm = group.strip().lower() if group else None
+    needle = filename_contains.strip().lower() if filename_contains else None
+    if group_norm is not None:
+        jobs = [j for j in jobs if (j.get("group") or "").strip().lower() == group_norm]
+    if needle is not None:
+        jobs = [j for j in jobs if needle in (j.get("filename") or "").lower()]
+
     return {
+        "group_filter": group or None,
+        "filename_filter": filename_contains or None,
         "count": len(jobs),
         "jobs": [
             {
@@ -509,6 +693,177 @@ async def list_jobs() -> dict:
             for j in jobs
         ],
     }
+
+
+@mcp.tool()
+def search_transcripts(query: str, group: str = "", max_results: int = 15, context_lines: int = 1) -> dict:
+    """Search completed interview filenames, titles, job IDs, and transcript text.
+
+    Use this for BOTH known interview identifiers (for example arint008) and
+    topics mentioned in interviews. Matching is case-insensitive substring
+    matching, not regex. Filename/title/ID matches do not require the query
+    to appear in the spoken transcript.
+
+    Returns matching jobs, matched_fields, transcript hit_count, and up to
+    five sample_hits with surrounding context. hit_count counts only text
+    matches; metadata-only matches have hit_count=0 and sample_hits=[].
+    After finding a match, call get_job(job_id) to retrieve the transcript.
+
+    Args:
+        query: Non-empty filename fragment, interview code, keyword, or phrase.
+        group: Optional case-insensitive exact group filter.
+        max_results: Maximum matching jobs returned; must be positive.
+        context_lines: Non-negative context lines before and after text hits.
+    """
+    query = (query or "").strip()
+    if not query:
+        return {"error": "query must be a non-empty keyword or phrase."}
+    if max_results < 1 or context_lines < 0:
+        return {"error": "max_results must be positive; context_lines must be non-negative."}
+    if not OUTPUTS_DIR.exists():
+        return {"count": 0, "matches": [], "note": f"outputs dir not found: {OUTPUTS_DIR}"}
+
+    group_norm = group.strip().lower() if group else None
+    needle = query.lower()
+    jobs_by_id = {j.get("id"): j for j in _load_jobs_index() if j.get("id")}
+
+    # Search group directories directly (cheaper than opening every .txt when
+    # a group filter narrows the directory scan).
+    group_dirs = (
+        [d for d in OUTPUTS_DIR.iterdir() if d.is_dir() and d.name.strip().lower() == group_norm]
+        if group_norm is not None
+        else [d for d in OUTPUTS_DIR.iterdir() if d.is_dir()]
+    )
+
+    matches: list[dict] = []
+    scanned = 0
+    for gdir in sorted(group_dirs):
+        for job_dir in sorted(gdir.iterdir()):
+            if not job_dir.is_dir():
+                continue
+            txt_files = list(job_dir.glob("*.txt"))
+            if not txt_files:
+                continue
+            scanned += 1
+            job_id = job_dir.name
+            meta = jobs_by_id.get(job_id, {})
+            metadata = {
+                "filename": meta.get("filename"),
+                "title": meta.get("title"),
+                "job_id": job_id,
+                "transcript_filename": txt_files[0].name,
+            }
+            matched_fields = [
+                field for field, value in metadata.items()
+                if value is not None and needle in str(value).lower()
+            ]
+            try:
+                lines = txt_files[0].read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                lines = []
+            hits = []
+            for i, line in enumerate(lines):
+                if needle in line.lower():
+                    lo = max(0, i - context_lines)
+                    hi = min(len(lines), i + context_lines + 1)
+                    hits.append({
+                        "line_no": i + 1,
+                        "context": "\n".join(lines[lo:hi]).strip(),
+                    })
+            if hits:
+                matched_fields.append("content")
+            if matched_fields:
+                matches.append({
+                    "job_id": job_id,
+                    "filename": meta.get("filename") or txt_files[0].name,
+                    "title": meta.get("title"),
+                    "matched_fields": matched_fields,
+                    "group": meta.get("group", gdir.name),
+                    "hit_count": len(hits),
+                    "sample_hits": hits[:5],
+                })
+            if len(matches) >= max_results:
+                break
+        if len(matches) >= max_results:
+            break
+
+    return {
+        "query": query,
+        "group_filter": group or None,
+        "transcripts_scanned": scanned,
+        "count": len(matches),
+        "matches": matches,
+        "note": "Call get_job(job_id) on a match to pull the full transcript into context.",
+    }
+
+
+@mcp.tool()
+def read_transcript_chunk(
+    job_id: str,
+    start_char: int,
+    max_chars: int = 12000,
+) -> dict:
+    """Read transcript text by job ID without get_job's preview truncation.
+
+    Start at start_char=0. Continue using next_start_char until has_more=false.
+    Offsets are zero-based Python character offsets, not bytes or tokens.
+    Each response includes a SHA-256 fingerprint; stop if it changes between calls.
+    Use this tool, not read_file or resource URIs, for long interview retrieval.
+    Read all chunks before claiming full coverage. Earlier chunks may still leave
+    the model context: retain an evidence table with quotes and offsets.
+    """
+    import hashlib
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+        return {"error": "Invalid job_id; use the exact ID returned by list_jobs."}
+    if start_char < 0 or not 1 <= max_chars <= 20000:
+        return {
+            "error": "start_char must be nonnegative; max_chars must be 1..20000."
+        }
+
+    root = OUTPUTS_DIR.resolve()
+    candidates = []
+    for candidate in root.glob(f"*/{job_id}/*.txt"):
+        resolved = candidate.resolve()
+        if resolved.is_relative_to(root) and resolved.is_file():
+            candidates.append(resolved)
+    candidates = sorted(set(candidates))
+
+    if len(candidates) != 1:
+        return {
+            "error": "Expected exactly one transcript file for this job.",
+            "candidate_count": len(candidates),
+        }
+
+    path = candidates[0]
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8", errors="replace")
+    except OSError as exc:
+        return {
+            "error": f"Cannot read transcript: {type(exc).__name__}: {exc}"
+        }
+
+    total = len(text)
+    if start_char > total:
+        return {
+            "error": "start_char exceeds transcript length.",
+            "total_chars": total,
+        }
+
+    end = min(start_char + max_chars, total)
+    return {
+        "job_id": job_id,
+        "transcript_filename": path.name,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "start_char": start_char,
+        "end_char_exclusive": end,
+        "total_chars": total,
+        "has_more": end < total,
+        "next_start_char": end if end < total else None,
+        "text": text[start_char:end],
+    }
+
 
 
 # --- Run as Streamable HTTP at /mcp (no trailing slash) ----------------------

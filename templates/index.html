@@ -179,6 +179,18 @@
               <div class="adv-section-label">Transcription (Whisper)</div>
               <div class="adv-grid">
                 <div class="adv-field">
+                  <label class="adv-label" for="advTranscriptionDevice">Transcription device <span class="adv-hint">per-job override of the saved default</span></label>
+                  <select id="advTranscriptionDevice" class="option-select">
+                    <option value="" selected>Use saved default</option>
+                  </select>
+                </div>
+                <div class="adv-field">
+                  <label class="adv-label" for="advDiarizationDevice">Diarization device <span class="adv-hint">per-job override of the saved default</span></label>
+                  <select id="advDiarizationDevice" class="option-select">
+                    <option value="" selected>Use saved default</option>
+                  </select>
+                </div>
+                <div class="adv-field">
                   <label class="adv-label" for="advBeamSize">Beam size <span class="adv-hint">1=greedy/fast, 5=accurate/slower</span></label>
                   <input type="number" id="advBeamSize" class="option-input" value="1" min="1" max="10">
                 </div>
@@ -240,6 +252,50 @@
             </div>
           </div>  <!-- advanced-settings -->
 
+          <!-- Compute Devices (persistent defaults) -->
+          <div class="advanced-settings" id="computeSettings">
+            <button class="advanced-settings-toggle" id="computeToggle" onclick="const body = document.getElementById('computeSettingsBody'); body.hidden = !body.hidden; this.setAttribute('aria-expanded', String(!body.hidden)); this.closest('.advanced-settings').classList.toggle('advanced-settings--open', !body.hidden); this.querySelector('.adv-chevron').classList.toggle('adv-chevron--open', !body.hidden)" type="button">&#9881; Compute Devices<span class="adv-chevron">&#9660;</span></button>
+            <div class="advanced-settings-body" id="computeSettingsBody" hidden>
+
+              <div class="adv-section-label">Saved defaults — apply to newly submitted jobs</div>
+              <div class="adv-grid">
+                <div class="adv-field">
+                  <label class="adv-label" for="computeTranscriptionDevice">Transcription device</label>
+                  <select id="computeTranscriptionDevice" class="option-select"></select>
+                </div>
+                <div class="adv-field">
+                  <label class="adv-label" for="computeDiarizationDevice">Diarization device</label>
+                  <select id="computeDiarizationDevice" class="option-select"></select>
+                </div>
+                <div class="adv-field">
+                  <label class="adv-label" for="computeWhisperPrecision">Whisper precision</label>
+                  <select id="computeWhisperPrecision" class="option-select">
+                    <option value="auto" selected>Automatic (low-memory policy)</option>
+                    <option value="int8_float32">int8_float32 (Pascal GPUs)</option>
+                    <option value="int8_float16">int8_float16 (modern GPUs)</option>
+                    <option value="int8">int8</option>
+                    <option value="float16">float16</option>
+                    <option value="float32">float32</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="compute-actions">
+                <button type="button" class="compute-btn" id="computeSaveBtn">Save defaults</button>
+                <button type="button" class="compute-btn compute-btn--secondary" id="computeTestBtn">Test selected configuration</button>
+                <label class="checkbox-label compute-smoke-label">
+                  <input type="checkbox" id="computeTestSmoke">
+                  <span class="checkbox-custom"></span>
+                  Include model smoke tests (loads Whisper + pyannote)
+                </label>
+              </div>
+
+              <div class="compute-status" id="computeStatus"></div>
+              <div class="compute-test-result" id="computeTestResult"></div>
+
+            </div>
+          </div>  <!-- compute-settings -->
+
           <button class="btn-transcribe" id="btnTranscribe" disabled>
             <svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true">
               <circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.5"/>
@@ -289,6 +345,6 @@
     </div>
   </div>
 
-  <script src="/static/js/app.js?v=5"></script>
+  <script src="/static/js/app.js?v=6"></script>
 </body>
 </html>
